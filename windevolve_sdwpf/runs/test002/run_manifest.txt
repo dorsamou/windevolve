@@ -1,0 +1,9 @@
+run_id: test002
+timestamp: 2026-07-16T23:05:32Z
+iterations: 5
+notes: verify harness after git cleanup
+git_commit: e9487fbbaab4129fa8bc29ce4cf9c25cccf7df7c
+--- SDWPF_* environment ---
+SDWPF_CSV=/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/sdwpf_kddcup/sdwpf_245days_v1.csv
+--- command ---
+python "/Users/dorsam/Documents/SRIP 2026/openevolve-main/openevolve-run.py" initial_program.py evaluator.py --config config.yaml --iterations 5
