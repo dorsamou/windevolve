@@ -1,0 +1,9 @@
+wind_forecasting_data/
+openevolve-main/
+*.csv
+*.parquet
+*.zip
+__pycache__/
+*.pyc
+.DS_Store
+EOF
