@@ -1,0 +1,49 @@
+# OpenEvolve config: SDWPF FULL FARM, KDD Cup 2022 protocol.
+# Gemini free tier. Each candidate scores all 134 turbines, so evaluation is
+# heavy -- the timeout is generous and parallelism is 1 (rate limit + memory).
+
+max_iterations: 60
+checkpoint_interval: 5     # save often: full-farm runs are long, spread over days
+
+llm:
+  primary_model: "gemini-3.1-flash-lite"
+  primary_model_weight: 0.8
+  secondary_model: "gemini-3.1-flash-lite"
+  secondary_model_weight: 0.2
+  api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.8
+  max_tokens: 8000
+
+prompt:
+  system_message: >
+    You are improving a Python function
+    `forecast(train_series, history_windows, feature_cols, target_col, input_len,
+    output_len)` for the KDD Cup 2022 SDWPF task. For each origin, predict the next
+    output_len=288 values (48h) of wind turbine active power (Patv, kW) from an
+    input_len=144-step history window of 10 SCADA features (history_windows shape
+    (n_origins, input_len, n_features); Patv at feature_cols.index(target_col)).
+    No future weather is available. The SAME function is applied to all 134
+    turbines and the score is summed, so it must generalize across turbines. Wind
+    speed (Wspd) drives power through a nonlinear curve; power is periodic (daily)
+    and strongly autocorrelated. The score is (RMSE+MAE)/2 in MW summed over
+    turbines, lower is better. Beat persistence with recent-power dynamics, wind
+    speed, diurnal structure, or a model fit on train_series. Fit only on
+    train_series; no future data. Return shape exactly (n_origins, output_len);
+    power >= 0.
+
+database:
+  population_size: 30
+  archive_size: 12
+  num_islands: 1
+  migration_interval: 999999
+  migration_rate: 0.0
+  exploration_ratio: 0.2
+  exploitation_ratio: 0.7
+
+evaluator:
+  timeout: 1200            # full-farm evaluation can take minutes per candidate
+  parallel_evaluations: 1
+
+diff_based_evolution: true
+max_code_length: 16000

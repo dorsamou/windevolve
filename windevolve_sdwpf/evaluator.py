@@ -1,11 +1,19 @@
 """
 OpenEvolve evaluator: SDWPF FULL FARM, KDD Cup 2022 protocol.
 
-Scores exactly like the competition so results sit on the published leaderboard
-scale (the paper's GRU baseline = 42.32 on the 214/31 split):
+This is the FAST FITNESS SIGNAL that drives evolution -- it follows the
+competition's method so scores sit on the published scale (GRU baseline = 42.32
+on the 214/31 split), but the definitive leaderboard number should be produced
+by running the champion's predictions through the competition's own metrics.py.
+Don't treat this evaluator's number as the final reported figure; treat it as a
+faithful ranking signal.
+
+Method (matches the competition):
   - forecast output_len=288 steps (48h) ahead from input_len=144 history, no future weather;
-  - per turbine: roll K origins over the validation days, compute RMSE and MAE in
-    MEGAWATTS on the unmasked steps, average over origins;
+  - origins slide by STRIDE=1 across the whole validation window (like their
+    WindTurbineDataset loader), scoring at each; N_ORIGINS optionally subsamples
+    those evenly for speed (0 = uncapped/exact);
+  - per turbine: RMSE and MAE in MEGAWATTS on the unmasked steps, averaged over origins;
   - FARM score = sum over all 134 turbines of (RMSE + MAE)/2. Lower is better.
   - KDD masking (curtailed/abnormal excluded) and Patv<0 -> 0 applied.
 
@@ -19,9 +27,11 @@ that's the final leaderboard number, scored once on the best program separately.
 The per-turbine data/windows are cached on first call (built once, reused every
 iteration) so only forecast() re-runs per candidate.
 
-Env (defaults = competition-comparable):
+Env:
   SDWPF_CSV (the full 245-day file), SDWPF_INPUT_LEN=144, SDWPF_OUTPUT_LEN=288,
-  SDWPF_TRAIN_DAYS=214, SDWPF_VAL_DAYS=31, SDWPF_DAY_LEN=144, SDWPF_N_ORIGINS=64,
+  SDWPF_TRAIN_DAYS=214, SDWPF_VAL_DAYS=31, SDWPF_DAY_LEN=144,
+  SDWPF_N_ORIGINS=195 (fast cap for evolution; 0 = uncapped exact),
+  SDWPF_STRIDE=1 (competition sliding-window step),
   SDWPF_MAX_TURBINES (limit turbines for speed while developing; default all).
 """
 import os
@@ -37,12 +47,13 @@ except Exception:
     EvaluationResult = None
 
 DATA_PATH = os.environ.get("SDWPF_CSV", "sdwpf_245days_v1.csv")
-INPUT_LEN = int(os.environ.get("SDWPF_INPUT_LEN", "144"))
+INPUT_LEN = int(os.environ.get("SDWPF_INPUT_LEN", "144")) # can go up to 14 days 
 OUTPUT_LEN = int(os.environ.get("SDWPF_OUTPUT_LEN", "288"))
 TRAIN_DAYS = int(os.environ.get("SDWPF_TRAIN_DAYS", "214"))
 VAL_DAYS = int(os.environ.get("SDWPF_VAL_DAYS", "31"))
 DAY_LEN = int(os.environ.get("SDWPF_DAY_LEN", "144"))
-N_ORIGINS = int(os.environ.get("SDWPF_N_ORIGINS", "64"))
+N_ORIGINS = int(os.environ.get("SDWPF_N_ORIGINS", "195"))  # fast cap for evolution; set 0 = uncapped exact
+STRIDE = int(os.environ.get("SDWPF_STRIDE", "1"))            # competition rolls origins by stride
 MAX_TURBINES = os.environ.get("SDWPF_MAX_TURBINES", "")
 
 FEATURE_COLS = ["Wspd", "Wdir", "Etmp", "Itmp", "Ndir", "Pab1", "Pab2", "Pab3", "Prtv", "Patv"]
@@ -82,9 +93,22 @@ def _build_cache():
         if n < val_end:
             continue
         if origins is None:
+            # Match the competition's data loader (WindTurbineDataset): a sliding
+            # window of stride 1 across the ENTIRE validation period, scoring at
+            # every consecutive origin. Their "cnt_sample" is just how many full
+            # (input_len + output_len) windows fit -- not a chosen count.
+            # STRIDE defaults to 1 (exact match). N_ORIGINS is an OPTIONAL cap:
+            # 0/empty = uncapped (competition-faithful); a positive number
+            # subsamples evenly for faster development runs.
             lo = max(train_end, INPUT_LEN)
             hi = min(val_end, n) - OUTPUT_LEN
-            origins = np.unique(np.linspace(lo, hi, N_ORIGINS).astype(int))
+            all_origins = np.arange(lo, hi + 1, STRIDE)
+            if N_ORIGINS and N_ORIGINS > 0 and N_ORIGINS < len(all_origins):
+                # even subsample across the full window (fast dev), not the first K
+                pick = np.linspace(0, len(all_origins) - 1, N_ORIGINS).astype(int)
+                origins = all_origins[np.unique(pick)]
+            else:
+                origins = all_origins
 
         hw = np.stack([filled[t - INPUT_LEN:t] for t in origins])
         gts = np.stack([raw[t:t + OUTPUT_LEN, _IDX["Patv"]] for t in origins])

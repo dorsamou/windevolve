@@ -6,7 +6,7 @@ max_iterations: 60
 checkpoint_interval: 5     # save often: full-farm runs are long, spread over days
 
 llm:
-  primary_model: "gemini-3.1-flash-lite"
+  primary_model: "gemini-3.1-flash-lite" # same secondary and primary
   primary_model_weight: 0.8
   secondary_model: "gemini-3.1-flash-lite"
   secondary_model_weight: 0.2

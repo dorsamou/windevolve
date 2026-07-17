@@ -36,4 +36,5 @@ if __name__ == "__main__":
     hw = np.random.RandomState(0).rand(8, 144, len(cols)) * 100
     tr = pd.DataFrame(np.random.rand(500, len(cols)) * 100, columns=cols)
     out = forecast(tr, hw, cols, "Patv", 144, 288)
+    # checks the shape of the output 
     print("shape:", out.shape, "| expected:", (8, 288))
