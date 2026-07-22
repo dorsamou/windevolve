@@ -1,0 +1,17 @@
+{
+  "id": "4f1e2858-3e29-4863-9793-37f7d1580509",
+  "generation": 2,
+  "iteration": 8,
+  "current_iteration": 15,
+  "metrics": {
+    "combined_score": 0.13169129827650827,
+    "skill_vs_persistence": 0.13169129827650827,
+    "farm_score_mw": 37.53444094676765,
+    "farm_rmse_mw": 41.575435019207006,
+    "farm_mae_mw": 33.4934468743283,
+    "turbines_scored": 134
+  },
+  "language": "python",
+  "timestamp": 1784324885.032245,
+  "saved_at": 1784324967.2625868
+}

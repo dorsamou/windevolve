@@ -1,0 +1,9 @@
+run_id: sweep300
+timestamp: 2026-07-17T21:46:58Z
+iterations: 300
+notes: iteration budget sweep - single long run
+git_commit: 5e41e954d17ef78bf29e8803b8920ceb07be86d5
+--- SDWPF_* environment ---
+SDWPF_CSV=/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/sdwpf_kddcup/sdwpf_245days_v1.csv
+--- command ---
+python "/Users/dorsam/Documents/SRIP 2026/openevolve-main/openevolve-run.py" initial_program.py evaluator.py --config config.yaml --iterations 300
