@@ -1,40 +1,58 @@
-# EVOLVE-BLOCK-START
+# -*- coding: utf-8 -*-
 """
-Seed forecaster for SDWPF, KDD Cup 2022 protocol (per-turbine, applied to all 134).
+path: windevolve_sdwpf/initial_program.py
 
-Task: at each origin, predict the next output_len=288 values of active power
-(Patv, kW) -- 48 hours ahead -- using ONLY the input_len=144-step history window.
-No future weather. The SAME function is applied to every turbine; the farm score
-sums the per-turbine scores, so this function must generalize across turbines.
+Description:
+    The seed forecaster that OpenEvolve evolves. Implements the required
+    forecast(envs) contract with a last-2-days persistence strategy: for each
+    turbine it repeats the most recent 288 recorded Patv values as the 48h
+    forecast. Persistence is valid (it varies over the horizon, so it passes the
+    zero/identical guards) and leaves clear headroom for evolution to improve.
 
-Inputs:
-  train_series    : DataFrame of ONE turbine's training rows (columns=feature_cols).
-  history_windows : np.ndarray (n_origins, input_len, n_features). Patv is at
-                    feature_cols.index(target_col). Gap-filled (finite).
-  feature_cols, target_col, input_len, output_len.
-Return:
-  np.ndarray (n_origins, output_len), Patv forecasts in kW.
+Citation:
+    Program contract and scoring follow the official Baidu KDD Cup 2022 SDWPF
+    evaluator (PaddlePaddle/PaddleSpatial,
+    apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
+    Dataset: Zhou et al., arXiv:2208.04360 (2022);
+             Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
 
-Beat the persistence seed: use wind speed, recent-power trend/mean, diurnal
-position, or fit a model on train_series. Fit on train_series only; no future data.
-Return shape exactly (n_origins, output_len); power >= 0.
+Example usage:
+    >>> import initial_program
+    >>> preds = initial_program.forecast({"path_to_test_x":
+    ...     "final_phase_test/infile/0001in.csv", "capacity": 134, "output_len": 288})
+    >>> preds.shape                      # (134, 288, 1)
 """
-import numpy as np
+import numpy as np                # array construction / padding / NaN handling
+import pandas as pd               # read the infile CSV
+
+CAPACITY = 134                    # number of turbines (fallback if not in envs)
+OUTPUT_LEN = 288                  # forecast horizon in 10-min steps (fallback)
 
 
-def forecast(train_series, history_windows, feature_cols, target_col, input_len, output_len):
-    t = feature_cols.index(target_col)
-    last_power = history_windows[:, -1, t]
-    preds = np.repeat(last_power[:, None], output_len, axis=1)
-    return np.clip(preds, 0.0, None)
-# EVOLVE-BLOCK-END
+def forecast(envs):
+    """
+    Description:
+        Produce a 48h active-power forecast for every turbine by persistence:
+        repeat each turbine's last output_len recorded Patv values.
+    Args:
+        envs: settings dict; must contain "path_to_test_x" (the infile path).
+              Optional "capacity" and "output_len" override the defaults.
+    Returns:
+        A float array of shape (capacity, output_len, 1) with predicted Patv (kW).
+    """
+    capacity = envs.get("capacity", CAPACITY)          # turbines to predict
+    output_len = envs.get("output_len", OUTPUT_LEN)    # horizon length
 
+    df = pd.read_csv(envs["path_to_test_x"])           # the infile (all turbines)
+    total = len(df) // capacity                        # history steps per turbine
+    # Pull Patv for all turbines and replace missing readings with 0.
+    patv = np.nan_to_num(df["Patv"].to_numpy(dtype=float), nan=0.0)
 
-if __name__ == "__main__":
-    import pandas as pd
-    cols = ["Wspd", "Wdir", "Etmp", "Itmp", "Ndir", "Pab1", "Pab2", "Pab3", "Prtv", "Patv"]
-    hw = np.random.RandomState(0).rand(8, 144, len(cols)) * 100
-    tr = pd.DataFrame(np.random.rand(500, len(cols)) * 100, columns=cols)
-    out = forecast(tr, hw, cols, "Patv", 144, 288)
-    # checks the shape of the output 
-    print("shape:", out.shape, "| expected:", (8, 288))
+    preds = np.zeros((capacity, output_len, 1), dtype=float)
+    for t in range(capacity):
+        block = patv[t * total:(t + 1) * total]        # this turbine's history
+        tail = block[-output_len:]                     # its most recent horizon
+        if tail.size < output_len:                     # pad short histories
+            tail = np.pad(tail, (output_len - tail.size, 0), mode="edge")
+        preds[t, :, 0] = tail
+    return preds

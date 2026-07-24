@@ -1,8 +1,0 @@
-run_id: islands1_r3
-variant: islands1
-config: config_islands1.yaml
-iterations: 100
-timestamp: 2026-07-17T19:40:38Z
-git_commit: 682d5a8c28fb3dff088ab59075a9b53ec273dc58
-SDWPF_CSV=/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/sdwpf_kddcup/sdwpf_245days_v1.csv
-SDWPF_N_ORIGINS=195

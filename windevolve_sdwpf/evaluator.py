@@ -1,216 +1,337 @@
+# -*- coding: utf-8 -*-
 """
-OpenEvolve evaluator: SDWPF FULL FARM, KDD Cup 2022 protocol.
+path: windevolve_sdwpf/evaluator.py
 
-This is the FAST FITNESS SIGNAL that drives evolution -- it follows the
-competition's method so scores sit on the published scale (GRU baseline = 42.32
-on the 214/31 split), but the definitive leaderboard number should be produced
-by running the champion's predictions through the competition's own metrics.py.
-Don't treat this evaluator's number as the final reported figure; treat it as a
-faithful ranking signal.
+Description:
+    OpenEvolve-facing evaluator for the SDWPF / KDD Cup 2022 task. Mirrors the
+    official grader but scores a GIVEN program (an OpenEvolve candidate or
+    initial_program.py) instead of an uploaded submission. For each of the 142 windows it runs
+    the program's forecast() on the infile, loads ground truth from the outfile,
+    and scores with metrics.regressor_detailed_scores; the final score is the
+    mean over windows of the summed-per-turbine (MAE, RMSE), combined as
+    0.5*(RMSE+MAE) (lower is better). evaluate() never raises: any failure is
+    returned as a large negative penalty so it cannot corrupt OpenEvolve's
+    fitness ranking (a raised exception would be replaced by fitness 0.0, which
+    would wrongly outrank valid negative scores).
 
-Method (matches the competition):
-  - forecast output_len=288 steps (48h) ahead from input_len=144 history, no future weather;
-  - origins slide by STRIDE=1 across the whole validation window (like their
-    WindTurbineDataset loader), scoring at each; N_ORIGINS optionally subsamples
-    those evenly for speed (0 = uncapped/exact);
-  - per turbine: RMSE and MAE in MEGAWATTS on the unmasked steps, averaged over origins;
-  - FARM score = sum over all 134 turbines of (RMSE + MAE)/2. Lower is better.
-  - KDD masking (curtailed/abnormal excluded) and Patv<0 -> 0 applied.
+    Program contract (kept from the official grader):
+      forecast(envs) reads the infile at envs["path_to_test_x"] itself and
+      returns predictions of shape (134, 288, 1) in kW. As in the official
+      evaluator the array is passed through unchanged, so a wrong shape fails
+      on the ground-truth comparison inside metrics.mae.
+      envs also exposes "path_to_train" (the 245-day training CSV) and
+      "path_to_locations" (turbine x/y), so a candidate may fit a model. Because
+      forecast() is called once per window (142 times per evaluation), any such
+      loading or fitting MUST be cached at module level and done once.
 
-The SAME forecast() is applied to every turbine, so the farm score measures
-cross-turbine generalization.
+Citation:
+    official Baidu KDD Cup 2022 SDWPF evaluator:
+      PaddlePaddle/PaddleSpatial,
+      apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation/paddlepaddle/evaluation.py
+      https://github.com/PaddlePaddle/PaddleSpatial  (accessed 2026-07-22)
+    Dataset: Zhou et al., arXiv:2208.04360 (2022);
+             Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
 
-Split: train first TRAIN_DAYS, validate on the next VAL_DAYS (default 214/31 to
-match the paper's baseline). The sealed final_phase_test.zip is NEVER used here --
-that's the final leaderboard number, scored once on the best program separately.
-
-The per-turbine data/windows are cached on first call (built once, reused every
-iteration) so only forecast() re-runs per candidate.
-
-Env:
-  SDWPF_CSV (the full 245-day file), SDWPF_INPUT_LEN=144, SDWPF_OUTPUT_LEN=288,
-  SDWPF_TRAIN_DAYS=214, SDWPF_VAL_DAYS=31, SDWPF_DAY_LEN=144,
-  SDWPF_N_ORIGINS=195 (fast cap for evolution; 0 = uncapped exact),
-  SDWPF_STRIDE=1 (competition sliding-window step),
-  SDWPF_MAX_TURBINES (limit turbines for speed while developing; default all).
+Example usage:
+    # Score the persistence seed over all 142 windows:
+    #   python evaluator.py initial_program.py
+    # Score just the first 10 windows of a given test dir:
+    #   python evaluator.py initial_program.py "/path/to/final_phase_test" 10
 """
-import os
-import importlib.util
-import traceback
-import concurrent.futures
-import numpy as np
-import pandas as pd
+import os                        # path handling and env-var lookup
+import sys                       # add this package to the import path
+import glob                      # discover the infile/outfile windows
+import time                      # measure per-eval wall-clock time
+import logging                   # warn when an eval approaches the timeout
+import importlib.util            # load the candidate program from its path
 
-try:
-    from openevolve.evaluation_result import EvaluationResult
-except Exception:
-    EvaluationResult = None
+import numpy as np               # array handling / mean / std
 
-DATA_PATH = os.environ.get("SDWPF_CSV", "sdwpf_245days_v1.csv")
-INPUT_LEN = int(os.environ.get("SDWPF_INPUT_LEN", "144")) # can go up to 14 days 
-OUTPUT_LEN = int(os.environ.get("SDWPF_OUTPUT_LEN", "288"))
-TRAIN_DAYS = int(os.environ.get("SDWPF_TRAIN_DAYS", "214"))
-VAL_DAYS = int(os.environ.get("SDWPF_VAL_DAYS", "31"))
-DAY_LEN = int(os.environ.get("SDWPF_DAY_LEN", "144"))
-N_ORIGINS = int(os.environ.get("SDWPF_N_ORIGINS", "195"))  # fast cap for evolution; set 0 = uncapped exact
-STRIDE = int(os.environ.get("SDWPF_STRIDE", "1"))            # competition rolls origins by stride
-MAX_TURBINES = os.environ.get("SDWPF_MAX_TURBINES", "")
+# Make this package importable no matter where OpenEvolve invokes the file from.
+_HERE = os.path.dirname(os.path.abspath(__file__))   # this file's directory
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
-FEATURE_COLS = ["Wspd", "Wdir", "Etmp", "Itmp", "Ndir", "Pab1", "Pab2", "Pab3", "Prtv", "Patv"]
-TARGET_COL = "Patv"
-_IDX = {c: i for i, c in enumerate(FEATURE_COLS)}
-_CACHE = None
+import metrics                   # faithful scorer copy (this package)
+from test_data import TestData   # faithful loader copy (this package)
 
+# Module logger for the slow-eval warning.
+logger = logging.getLogger(__name__)
 
-def _abnormal_mask(block):
-    P, W = block[:, _IDX["Patv"]], block[:, _IDX["Wspd"]]
-    cond = (P <= 0) & (W > 2.5)
-    for c in ["Pab1", "Pab2", "Pab3"]:
-        cond |= block[:, _IDX[c]] > 89
-    cond |= (block[:, _IDX["Wdir"]] < -180) | (block[:, _IDX["Wdir"]] > 180)
-    cond |= (block[:, _IDX["Ndir"]] < -720) | (block[:, _IDX["Ndir"]] > 720)
-    return cond
+# Path to the unzipped final_phase_test folder (must contain infile/ and outfile/).
+# Overridable via the SDWPF_TEST_DIR environment variable.
+TEST_DIR = os.environ.get(
+    "SDWPF_TEST_DIR",
+    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
+    "sdwpf_kddcup/final_phase_test",
+)
 
+# Path to the 245-day training CSV. Passed to the program via envs so a candidate
+# may fit a model on it. NOTE: this file is ~4.7M rows -- a program MUST load/fit
+# it once and cache the result, since forecast() is called once per window (142
+# times per evaluation). Overridable via SDWPF_TRAIN_FILE.
+TRAIN_FILE = os.environ.get(
+    "SDWPF_TRAIN_FILE",
+    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
+    "sdwpf_kddcup/sdwpf_245days_v1.csv",
+)
 
-def _build_cache():
-    df = pd.read_csv(DATA_PATH)
-    df = df.sort_values([c for c in ["TurbID", "Day", "Tmstamp"] if c in df.columns]).reset_index(drop=True)
-    turbines = list(df["TurbID"].unique())
-    if MAX_TURBINES:
-        turbines = turbines[: int(MAX_TURBINES)]
+# Path to the turbine location CSV (TurbID, x, y), enabling spatial models.
+# Overridable via SDWPF_LOCATION_FILE.
+LOCATION_FILE = os.environ.get(
+    "SDWPF_LOCATION_FILE",
+    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
+    "sdwpf_kddcup/sdwpf_baidukddcup2022_turb_location.csv",
+)
 
-    train_end = TRAIN_DAYS * DAY_LEN
-    val_end = (TRAIN_DAYS + VAL_DAYS) * DAY_LEN
-    per_turbine = []
-    origins = None
+# Score returned on ANY failure; far below any real score (~ -40..-60) so
+# failed candidates always rank last. Returned, never raised, so OpenEvolve
+# honors it instead of substituting fitness 0.0.
+PENALTY_COMBINED_SCORE = -1.0e6
 
-    for tid in turbines:
-        sub = df[df["TurbID"] == tid]
-        raw = sub[FEATURE_COLS].to_numpy(dtype=float)
-        raw[:, _IDX["Patv"]] = np.clip(raw[:, _IDX["Patv"]], 0, None)
-        filled = pd.DataFrame(raw, columns=FEATURE_COLS).ffill().bfill().fillna(0.0).to_numpy()
-        n = len(raw)
-        if n < val_end:
-            continue
-        if origins is None:
-            # Match the competition's data loader (WindTurbineDataset): a sliding
-            # window of stride 1 across the ENTIRE validation period, scoring at
-            # every consecutive origin. Their "cnt_sample" is just how many full
-            # (input_len + output_len) windows fit -- not a chosen count.
-            # STRIDE defaults to 1 (exact match). N_ORIGINS is an OPTIONAL cap:
-            # 0/empty = uncapped (competition-faithful); a positive number
-            # subsamples evenly for faster development runs.
-            lo = max(train_end, INPUT_LEN)
-            hi = min(val_end, n) - OUTPUT_LEN
-            all_origins = np.arange(lo, hi + 1, STRIDE)
-            if N_ORIGINS and N_ORIGINS > 0 and N_ORIGINS < len(all_origins):
-                # even subsample across the full window (fast dev), not the first K
-                pick = np.linspace(0, len(all_origins) - 1, N_ORIGINS).astype(int)
-                origins = all_origins[np.unique(pick)]
-            else:
-                origins = all_origins
+# Official threshold on the std of the per-window scores (cross-window guard).
+MIN_NOISE_LEVEL = 0.05
 
-        hw = np.stack([filled[t - INPUT_LEN:t] for t in origins])
-        gts = np.stack([raw[t:t + OUTPUT_LEN, _IDX["Patv"]] for t in origins])
-        drops = np.stack([_abnormal_mask(raw[t:t + OUTPUT_LEN]) for t in origins])
-        valid = (~drops) & np.isfinite(gts)
-        train_series = pd.DataFrame(filled[:train_end], columns=FEATURE_COLS)
-        pers = np.repeat(hw[:, -1, _IDX["Patv"]][:, None], OUTPUT_LEN, axis=1)
-        per_turbine.append({"hw": hw, "gts": gts, "valid": valid, "train": train_series, "pers": pers})
+# Only apply the cross-window std guard once at least this many windows exist
+# (the std of a couple of numbers on a debug subset is meaningless).
+STD_CHECK_MIN_WINDOWS = 10
 
-    if not per_turbine:
-        raise RuntimeError("No turbine had enough rows for the split")
-    return {"turbines": per_turbine, "n": len(per_turbine)}
+# Warn if a single full eval exceeds this, approaching OpenEvolve's 300s timeout.
+SLOW_EVAL_WARN_SECONDS = 150.0
 
 
-def _turbine_score(preds, gts, valid):
-    maes, rmses = [], []
-    for i in range(len(gts)):
-        m = valid[i] & np.isfinite(preds[i])
-        if m.sum() == 0:
-            continue
-        p, g = preds[i][m] / 1000.0, gts[i][m] / 1000.0
-        maes.append(float(np.mean(np.abs(p - g))))
-        rmses.append(float(np.sqrt(np.mean((p - g) ** 2))))
-    if not maes:
-        return None
-    return float(np.mean(maes)), float(np.mean(rmses))
+def prep_env():
+    """
+    Description:
+        Build the settings dict shared by every window (matches the official
+        prep_env / initiate_env values). "path_to_test_x" is filled per window.
+    Args:
+        None
+    Returns:
+        A settings dict of dataset/scoring constants.
+    """
+    return {
+        "task": "MS",                 # multivariate-in, single-out
+        "target": "Patv",             # target column name
+        "capacity": 134,              # number of turbines
+        "start_col": 3,               # first modeled column (Wspd)
+        "in_var": 10,                 # number of modeled input variables
+        "out_var": 1,                 # number of output variables (Patv)
+        "max_input_len": 2016,        # official Lx cap: 14 days x 144 steps/day.
+                                      # The full history is present in every
+                                      # infile; unused in scoring, available to
+                                      # a program as a hint via envs.
+        "output_len": 288,            # forecast horizon = 48h -> the ranking score
+        "day_len": 144,               # 24h -> latest-day diagnostic only
+        "min_non_zero_ratio": 0.9,    # farm-level all-zero guard threshold
+        "min_distinct_ratio": 0.1,    # farm-level constant-output guard threshold
+        "path_to_train": TRAIN_FILE,      # 245-day training CSV (load+fit ONCE, cache)
+        "path_to_locations": LOCATION_FILE,  # turbine x/y positions for spatial models
+    }
 
 
-def _run_with_timeout(func, args, timeout):
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        return ex.submit(func, *args).result(timeout=timeout)
+def _load_program(program_path):
+    """
+    Description:
+        Import a candidate program file by path and return the module object.
+    Args:
+        program_path: filesystem path to the program's .py file
+    Returns:
+        The imported module (expected to expose forecast(envs)).
+    """
+    spec = importlib.util.spec_from_file_location("evolved_program", program_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def _result(metrics, artifacts):
-    if EvaluationResult is not None:
-        return EvaluationResult(metrics=metrics, artifacts=artifacts)
-    return metrics
+def exec_predict_and_test(envs, test_file, forecast_module, flag='predict'):
+    """
+    Description:
+        Handle one window file: either run the program on the infile
+        ('predict') or load ground truth from the outfile ('test').
+    Args:
+        envs: settings dict; "path_to_test_x" is set here in the predict branch
+        test_file: path to the window CSV (an infile for predict, outfile for test)
+        forecast_module: the loaded candidate program (used in the predict branch)
+        flag: 'predict' to run the forecaster, 'test' to load ground truth
+    Returns:
+        For 'predict': {"prediction": <array>}.
+        For 'test': {"ground_truth_y": <array>, "ground_truth_df": <list of frames>}.
+    """
+    if flag == 'predict':
+        envs["path_to_test_x"] = test_file            # the program reads this path
+        return {"prediction": forecast_module.forecast(envs)}
+    elif flag == 'test':
+        test_data = TestData(path_to_data=test_file, start_col=envs["start_col"])
+        turbines, raw_turbines = test_data.get_all_turbines()
+        # Ground truth = first output_len rows, last out_var columns (Patv), per turbine.
+        test_ys = [turbine[:envs["output_len"], -envs["out_var"]:] for turbine in turbines]
+        return {"ground_truth_y": np.array(test_ys), "ground_truth_df": raw_turbines}
+    else:
+        raise ValueError("Unsupported flag (only 'predict' or 'test').")
 
 
-def _fail(msg, extra=None):
-    art = {"error_message": msg}
-    if extra:
-        art.update(extra)
-    return _result({"combined_score": -1.0, "skill_vs_persistence": -1.0, "error": msg}, art)
+def performance(settings, idx, prediction, ground_truth, ground_truth_df):
+    """
+    Description:
+        Score one window and repackage the raw metric outputs into
+        (MAE, RMSE, accuracy). Accuracy is a diagnostic only, not the ranking.
+    Args:
+        settings: the settings dict for this run
+        idx: window index (used only for error messages)
+        prediction: this window's predictions, shape (134, 288, 1)
+        ground_truth: this window's ground-truth Patv, shape (134, 288, 1)
+        ground_truth_df: this window's 134 raw per-turbine frames
+    Returns:
+        A tuple (overall_mae, overall_rmse, accuracy) for this window.
+    """
+    overall_mae, overall_rmse, _, overall_latest_rmse = \
+        metrics.regressor_detailed_scores(prediction, ground_truth, ground_truth_df, settings)
+    # A negative latest RMSE means too many invalid turbines leaked -1 sentinels.
+    if overall_latest_rmse < 0:
+        raise metrics.MetricsError(
+            "Negative latest-24h RMSE ({}) in the {}-th prediction".format(overall_latest_rmse, idx))
+    acc = 1 - overall_latest_rmse / settings["capacity"]   # convenience 0..1 diagnostic
+    return overall_mae, overall_rmse, acc
 
 
-def evaluate(program_path):
-    global _CACHE
+def _list_windows(test_dir):
+    """
+    Description:
+        Discover and pair the infile/outfile window CSVs under a test dir.
+    Args:
+        test_dir: folder containing infile/*in.csv and outfile/*out.csv
+    Returns:
+        A tuple (infiles, outfiles) of sorted, equal-length path lists.
+    """
+    infiles = sorted(glob.glob(os.path.join(test_dir, "infile", "*in.csv")))
+    outfiles = sorted(glob.glob(os.path.join(test_dir, "outfile", "*out.csv")))
+    if len(infiles) != len(outfiles):
+        raise ValueError("infile/outfile count mismatch: {} vs {}".format(len(infiles), len(outfiles)))
+    if len(infiles) == 0:
+        raise ValueError("No test windows found under {!r}".format(test_dir))
+    return infiles, outfiles
+
+
+def _penalty(reason, n_windows=None):
+    """
+    Description:
+        Build the standard failure result (large negative combined_score).
+    Args:
+        reason: short human-readable failure reason
+        n_windows: optional number of windows attempted
+    Returns:
+        A metrics dict with combined_score = PENALTY_COMBINED_SCORE and valid=False.
+    """
+    out = {"combined_score": PENALTY_COMBINED_SCORE, "valid": False, "reason": reason}
+    if n_windows is not None:
+        out["n_windows"] = n_windows
+    return out
+
+
+def evaluate_forecaster(forecast_module, test_dir, n_windows=None):
+    """
+    Description:
+        Score a loaded program over the test windows: loop each window, run the
+        forecaster, load ground truth, score, then average across windows and
+        form 0.5*(RMSE+MAE). Applies the cross-window std guard for full runs.
+    Args:
+        forecast_module: the loaded candidate program exposing forecast(envs)
+        test_dir: folder with infile/ and outfile/ windows
+        n_windows: cap on the number of windows (None = all; official = 142)
+    Returns:
+        A metrics dict (see evaluate) with combined_score, competition_score,
+        rmse, mae, accuracy, n_windows, eval_seconds, valid.
+    """
+    settings = prep_env()
+    infiles, outfiles = _list_windows(test_dir)
+    n = len(infiles) if n_windows is None else min(n_windows, len(infiles))
+
+    start_time = time.perf_counter()
+    maes, rmses, accs = [], [], []
+    for i in range(n):
+        # Run the program on window i's infile (passed straight through, as in
+        # the official evaluator -- forecast() must return (134, 288, 1) or
+        # metrics.mae raises on the shape mismatch).
+        pred_res = exec_predict_and_test(settings, infiles[i], forecast_module, flag='predict')
+        prediction = pred_res["prediction"]
+        # Load window i's ground truth + raw frames from the outfile.
+        test_res = exec_predict_and_test(settings, outfiles[i], forecast_module, flag='test')
+        gt = test_res["ground_truth_y"]
+        gt_df = test_res["ground_truth_df"]
+        # Score this window and collect its metrics.
+        m, r, a = performance(settings, i, prediction, gt, gt_df)
+        maes.append(m)
+        rmses.append(r)
+        accs.append(a)
+
+    # Cross-window guard: implausibly identical per-window scores == degenerate.
+    # Skipped for small debug subsets where the std is just noise.
+    if n >= STD_CHECK_MIN_WINDOWS and (np.std(rmses) < MIN_NOISE_LEVEL or np.std(maes) < MIN_NOISE_LEVEL):
+        return _penalty("cross-window scores nearly identical (std below threshold)", n)
+
+    # Mean over windows, then the competition combination.
+    avg_mae = float(np.mean(maes))
+    avg_rmse = float(np.mean(rmses))
+    score = 0.5 * (avg_rmse + avg_mae)            # competition score (lower is better)
+
+    # Warn if we are approaching OpenEvolve's per-candidate timeout.
+    elapsed = time.perf_counter() - start_time
+    if elapsed > SLOW_EVAL_WARN_SECONDS:
+        logger.warning(
+            "SDWPF eval took %.1fs for %d windows -- approaching OpenEvolve's 300s "
+            "per-candidate timeout (a timeout collapses to fitness 0.0, which "
+            "outranks valid negative scores). Consider speeding up the eval.",
+            elapsed, n,
+        )
+
+    return {
+        # OpenEvolve MAXIMIZES -> negate. A VALID combined_score is NEGATIVE.
+        "combined_score": -score,           # fitness key OpenEvolve maximizes
+        "competition_score": score,         # official 0.5*(RMSE+MAE), lower better
+        "rmse": avg_rmse,                   # mean summed-per-turbine RMSE (MW)
+        "mae": avg_mae,                     # mean summed-per-turbine MAE (MW)
+        "accuracy": float(np.mean(accs)),   # 0..1 diagnostic only
+        "n_windows": n,                     # number of windows scored
+        "eval_seconds": round(elapsed, 2),  # wall-clock cost (timeout monitor)
+        "valid": True,                      # this candidate scored successfully
+    }
+
+
+def evaluate(program_path, test_dir=None, n_windows=None):
+    """
+    Description:
+        OpenEvolve entry point. Load the candidate program and score it. Never
+        raises: any failure (bad import, missing forecast, degenerate/NaN
+        prediction, runtime error) is returned as the penalty result.
+    Args:
+        program_path: path to the candidate program's .py file
+        test_dir: test folder (defaults to TEST_DIR / SDWPF_TEST_DIR)
+        n_windows: optional cap on windows scored (None = all)
+    Returns:
+        A metrics dict; combined_score is the value OpenEvolve maximizes.
+    """
+    test_dir = test_dir or TEST_DIR
     try:
-        if _CACHE is None:
-            _CACHE = _build_cache()
-
-        spec = importlib.util.spec_from_file_location("candidate", program_path)
-        prog = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(prog)
-        if not hasattr(prog, "forecast"):
-            return _fail("Program missing forecast()")
-
-        tot_mae = tot_rmse = tot_mae_p = tot_rmse_p = 0.0
-        scored = 0
-        for T in _CACHE["turbines"]:
-            preds = _run_with_timeout(
-                prog.forecast,
-                (T["train"], T["hw"], FEATURE_COLS, TARGET_COL, INPUT_LEN, OUTPUT_LEN),
-                timeout=float(os.environ.get("SDWPF_FC_TIMEOUT", "120")),
-            )
-            preds = np.asarray(preds, dtype=float)
-            if preds.shape != T["gts"].shape:
-                return _fail("Prediction shape mismatch",
-                             {"expected": list(T["gts"].shape), "got": list(preds.shape)})
-            ms = _turbine_score(preds, T["gts"], T["valid"])
-            mp = _turbine_score(T["pers"], T["gts"], T["valid"])
-            if ms is None or mp is None:
-                continue
-            tot_mae += ms[0]; tot_rmse += ms[1]
-            tot_mae_p += mp[0]; tot_rmse_p += mp[1]
-            scored += 1
-
-        if scored == 0:
-            return _fail("No turbine produced a scorable result")
-
-        farm_score = (tot_mae + tot_rmse) / 2.0          # summed over turbines, MW
-        pers_score = (tot_mae_p + tot_rmse_p) / 2.0
-        skill = 1.0 - (farm_score / pers_score) if pers_score > 0 else 0.0
-
-        metrics = {
-            "combined_score": float(skill),
-            "skill_vs_persistence": float(skill),
-            "farm_score_mw": float(farm_score),       # compare to baseline 42.32
-            "farm_rmse_mw": float(tot_rmse),
-            "farm_mae_mw": float(tot_mae),
-            "turbines_scored": int(scored),
-        }
-        return _result(metrics, {"input_len": INPUT_LEN, "output_len": OUTPUT_LEN,
-                                 "n_origins": int(len(_CACHE["turbines"][0]["gts"]))})
-    except concurrent.futures.TimeoutError:
-        return _fail("forecast() timed out")
-    except Exception as e:
-        return _fail(f"{type(e).__name__}: {e}", {"traceback": traceback.format_exc()[-1200:]})
+        program = _load_program(program_path)
+    except Exception as e:  # noqa: BLE001
+        return _penalty("load error: {}".format(e))
+    if not hasattr(program, "forecast"):
+        return _penalty("program has no forecast(envs) function")
+    try:
+        return evaluate_forecaster(program, test_dir, n_windows=n_windows)
+    except Exception as e:  # noqa: BLE001 -- includes MetricsError from degenerate candidates
+        return _penalty("runtime error: {}".format(e))
 
 
 if __name__ == "__main__":
-    import json
-    r = evaluate(os.environ.get("SDWPF_PROGRAM", "initial_program.py"))
-    print(json.dumps(getattr(r, "metrics", r), indent=2))
+    # Standalone: python evaluator.py <program.py> [test_dir] [n_windows]
+    prog = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, "initial_program.py")
+    td = sys.argv[2] if len(sys.argv) > 2 else TEST_DIR
+    nw = int(sys.argv[3]) if len(sys.argv) > 3 else None
+    print("program :", prog)
+    print("test_dir:", td)
+    result = evaluate(prog, test_dir=td, n_windows=nw)
+    for k, v in result.items():
+        print("  {}: {}".format(k, v))

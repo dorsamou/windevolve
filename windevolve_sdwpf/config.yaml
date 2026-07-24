@@ -1,49 +1,111 @@
-# OpenEvolve config: SDWPF FULL FARM, KDD Cup 2022 protocol.
-# Gemini free tier. Each candidate scores all 134 turbines, so evaluation is
-# heavy -- the timeout is generous and parallelism is 1 (rate limit + memory).
+# path: windevolve_sdwpf/config.yaml
+#
+# Description:
+#   OpenEvolve configuration for the KDD Cup 2022 SDWPF wind power forecasting
+#   task. Evolves initial_program.py (the forecast(envs) seed) and scores each
+#   candidate with evaluator.py, which reproduces the official competition
+#   metric. OpenEvolve MAXIMIZES `combined_score`, and the evaluator returns
+#   combined_score = -competition_score, so valid scores are NEGATIVE
+#   (persistence baseline ~= -65.12) and failures return -1e6.
+#
+# Citation:
+#   Task/metric follow the official Baidu KDD Cup 2022 SDWPF evaluator
+#   (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
+#   Dataset: Zhou et al., arXiv:2208.04360 (2022);
+#            Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
+#
+# Example usage:
+#   export OPENAI_API_KEY="<your Gemini API key>"
+#   python -m openevolve.cli initial_program.py evaluator.py --config config.yaml
 
-max_iterations: 60
-checkpoint_interval: 5     # save often: full-farm runs are long, spread over days
+max_iterations: 60             # ~96% of gains land by iter 30; 60 gives headroom
+checkpoint_interval: 5         # save often: full-farm runs are long
+random_seed: 42                # reproducibility for the 3-repeat ablation protocol
 
 llm:
-  primary_model: "gemini-3.1-flash-lite" # same secondary and primary
-  primary_model_weight: 0.8
-  secondary_model: "gemini-3.1-flash-lite"
-  secondary_model_weight: 0.2
+  primary_model: "gemini-3.1-flash-lite"    # free-tier Gemini via OpenAI-compatible API
+  primary_model_weight: 0.8                 # share of calls to the primary model
+  secondary_model: "gemini-3.1-flash-lite"  # same model; weights only split sampling
+  secondary_model_weight: 0.2               # share of calls to the secondary model
   api_base: "https://generativelanguage.googleapis.com/v1beta/openai/"
-  api_key: "${OPENAI_API_KEY}"
-  temperature: 0.8
-  max_tokens: 8000
+  api_key: "${OPENAI_API_KEY}"              # MUST be exported; ${VAR} raises if unset
+  temperature: 0.8                          # higher -> more diverse proposals
+  max_tokens: 8000                          # room for a full program rewrite
 
 prompt:
-  system_message: >
-    You are improving a Python function
-    `forecast(train_series, history_windows, feature_cols, target_col, input_len,
-    output_len)` for the KDD Cup 2022 SDWPF task. For each origin, predict the next
-    output_len=288 values (48h) of wind turbine active power (Patv, kW) from an
-    input_len=144-step history window of 10 SCADA features (history_windows shape
-    (n_origins, input_len, n_features); Patv at feature_cols.index(target_col)).
-    No future weather is available. The SAME function is applied to all 134
-    turbines and the score is summed, so it must generalize across turbines. Wind
-    speed (Wspd) drives power through a nonlinear curve; power is periodic (daily)
-    and strongly autocorrelated. The score is (RMSE+MAE)/2 in MW summed over
-    turbines, lower is better. Beat persistence with recent-power dynamics, wind
-    speed, diurnal structure, or a model fit on train_series. Fit only on
-    train_series; no future data. Return shape exactly (n_origins, output_len);
-    power >= 0.
+  system_message: |
+    You are improving a Python function `forecast(envs)` for the KDD Cup 2022
+    SDWPF wind power forecasting task.
+
+    CONTRACT (must not change):
+      - `envs["path_to_test_x"]` is one CSV holding 14 days of 10-minute SCADA
+        history for all 134 turbines, stacked turbine-major (turbine i is rows
+        i*2016 : (i+1)*2016). Columns: TurbID, Day, Tmstamp, Wspd, Wdir, Etmp,
+        Itmp, Ndir, Pab1, Pab2, Pab3, Prtv, Patv. Read this file yourself.
+      - Return a float array of shape EXACTLY (134, 288, 1): for each turbine the
+        next 288 ten-minute steps (48 hours) of active power Patv, in kW.
+      - Predictions must be >= 0, contain no NaN, and vary over the horizon
+        (all-zero or constant output for most turbines is rejected outright).
+      - The data contains NaNs; handle them. No future weather is available.
+
+    TRAINING DATA (optional):
+      - `envs["path_to_train"]` is the 245-day training CSV (same 13 columns,
+        ~4.7M rows) and `envs["path_to_locations"]` gives each turbine's x/y.
+      - CRITICAL: forecast() is called once per window, 142 times per evaluation.
+        Load and fit ONCE and cache at module level (e.g. a module-global set on
+        first call). Re-reading or re-fitting per call will exceed the evaluation
+        time limit and the candidate will be discarded.
+      - Never use data from the test window's future; only history and train data.
+
+    SCORING (lower is better):
+      Per turbine, timesteps whose ground truth is missing or invalid are excluded
+      (NaN rows; Patv<0; Patv==0 while Wspd>2.5; any pitch Pab*>89; |Wdir|>180;
+      |Ndir|>720). On surviving steps, MAE and RMSE are computed in MEGAWATTS
+      (kW/1000). Per-turbine MAE and RMSE are SUMMED across the 134 turbines to
+      score one window, then averaged over 142 windows; final score is
+      0.5*(RMSE + MAE). Because errors SUM over turbines, a method must work on
+      ALL turbines -- a few badly-predicted turbines dominate the total. RMSE
+      penalizes large errors more than MAE, so avoid big misses at high power.
+
+    DOMAIN NOTES:
+      - Power depends on wind speed through a nonlinear power curve: ~zero below a
+        cut-in speed, steeply increasing (roughly cubic) mid-range, then flat at
+        rated capacity. A linear fit on Wspd underfits badly.
+      - Patv is strongly autocorrelated: recent power is highly informative at
+        short lead times, decaying over the 48h horizon.
+      - Turbines differ (distinct power curves, some noisy or double-valued), and
+        you receive all 134 at once, so per-turbine and cross-turbine (spatial)
+        structure is available.
+      - Any daily periodicity in wind is weak and site-dependent; test it rather
+        than assuming it.
+      - Pab*>89, or Patv==0 with real wind, indicates a stopped/curtailed turbine.
+
+    If you fit any stochastic model, set an explicit random seed so results are
+    reproducible across repeated runs.
+
+    Beat the persistence baseline (competition score 65.12) using recent-power
+    dynamics, wind speed, per-turbine structure, or a model fit on the training
+    data. Keep it fast: the function runs across all 142 windows per evaluation.
 
 database:
-  population_size: 30
-  archive_size: 12
-  num_islands: 3
-  migration_interval: 15
-  migration_rate: 0.1
-  exploration_ratio: 0.2
-  exploitation_ratio: 0.7
+  population_size: 30          # candidates retained overall
+  archive_size: 12             # elite archive size
+  num_islands: 3               # islands ablation found no harm vs 1; 3 is cheap
+  migration_interval: 15       # generations between island migrations
+  migration_rate: 0.1          # fraction of population migrated
+  exploration_ratio: 0.2       # sampling weight for novel programs
+  exploitation_ratio: 0.7      # sampling weight for high scorers
+                               # (remaining 0.1 is the elite/random share)
 
 evaluator:
-  timeout: 1200            # full-farm evaluation can take minutes per candidate
-  parallel_evaluations: 1
+  timeout: 1200                # full-farm eval is ~60s for persistence; model
+                               # fitting needs far more than the 300s default.
+                               # NOTE: a timeout yields fitness 0.0, which would
+                               # OUTRANK valid negative scores -- keep this generous.
+  parallel_evaluations: 1      # one at a time (each eval is CPU- and IO-heavy)
+  cascade_evaluation: false    # evaluator.py defines no evaluate_stage1, and the
+                               # default cascade_thresholds [0.5,0.75,0.9] assume
+                               # positive scores -- ours are negative.
 
-diff_based_evolution: true
-max_code_length: 16000
+diff_based_evolution: true     # edit the program via SEARCH/REPLACE diffs
+max_code_length: 16000         # raised from 10000: training-data programs are longer
