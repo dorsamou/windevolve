@@ -1,0 +1,12 @@
+brotlicffi==1.2.0.0
+jupyter==1.1.1
+matplotlib==3.11.0
+openevolve==0.3.1
+pip==26.1.2
+PySocks==1.7.1
+qtconsole==5.7.2
+scikit-learn==1.9.0
+statsmodels==0.14.6
+tinycss2==1.5.1
+torch==2.13.0
+xgboost==3.3.0
