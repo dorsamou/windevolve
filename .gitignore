@@ -6,8 +6,8 @@ openevolve-main/
 __pycache__/
 *.pyc
 .DS_Store
-EOF
 PaddleSpatial-main
 SRIP Literature
 autoresearch_wpf
 checkpoints
+*.joblib

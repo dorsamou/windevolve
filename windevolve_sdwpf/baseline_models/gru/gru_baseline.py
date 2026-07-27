@@ -47,6 +47,7 @@ Example usage:
 import os                                    # checkpoint paths, env vars
 import time                                  # timing
 import argparse                              # training CLI
+import sys
 
 import numpy as np                           # array math
 import pandas as pd                          # CSV reading
@@ -54,7 +55,19 @@ import torch                                 # model + training
 import torch.nn as nn                        # layers and loss
 from torch.utils.data import Dataset, DataLoader
 
+
+# This file lives in a subfolder (baseline_models/gru/), but test_data.py lives
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = _HERE
+for _ in range(4):
+    if os.path.exists(os.path.join(_ROOT, "test_data.py")):
+        break
+    _ROOT = os.path.dirname(_ROOT)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+ 
 from test_data import TestData               # official per-turbine window loader
+ 
 
 DAY_LEN = 144        # 10-minute observations per day
 START_COL = 3        # first modeled column (Wspd); 0-2 are TurbID/Day/Tmstamp
