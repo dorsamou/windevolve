@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-path: windevolve_sdwpf/gru_baseline.py
+path: windevolve_sdwpf/baseline_models/gru/gru_baseline.py
 
 Description:
     Single-file PyTorch port of the official Baidu KDD Cup 2022 SDWPF GRU
@@ -35,19 +35,18 @@ Citation:
              Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
 
 Example usage:
+    # Run from the package root (windevolve_sdwpf/):
     # 1. Validate the pipeline cheaply (a few turbines, one epoch):
-    python gru_baseline.py --turbines 0-2 --epochs 1
-    # 2. Time a single full turbine to decide local vs cluster:
-    time python gru_baseline.py --turbines 3 --overwrite
-    # 3. Full faithful training run (resumable; skips existing checkpoints):
-    python gru_baseline.py --turbines 0-133 --device cuda
-    # 4. Score the trained baseline with the official metric:
-    python evaluator.py gru_baseline.py
+    python baseline_models/gru/gru_baseline.py --turbines 0-2 --epochs 1
+    # 2. Full faithful training run (resumable; skips existing checkpoints):
+    python baseline_models/gru/gru_baseline.py --turbines 0-133 --device cuda
+    # 3. Score the trained baseline with the official metric:
+    python evaluator.py baseline_models/gru/gru_baseline.py
 """
 import os                                    # checkpoint paths, env vars
+import sys                                   # package-root discovery
 import time                                  # timing
 import argparse                              # training CLI
-import sys
 
 import numpy as np                           # array math
 import pandas as pd                          # CSV reading
@@ -55,8 +54,9 @@ import torch                                 # model + training
 import torch.nn as nn                        # layers and loss
 from torch.utils.data import Dataset, DataLoader
 
-
 # This file lives in a subfolder (baseline_models/gru/), but test_data.py lives
+# at the package root. Walk up until we find it, then put that on sys.path so
+# the import works whether this file is run directly or loaded by evaluator.py.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = _HERE
 for _ in range(4):
@@ -65,9 +65,8 @@ for _ in range(4):
     _ROOT = os.path.dirname(_ROOT)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
- 
+
 from test_data import TestData               # official per-turbine window loader
- 
 
 DAY_LEN = 144        # 10-minute observations per day
 START_COL = 3        # first modeled column (Wspd); 0-2 are TurbID/Day/Tmstamp
@@ -80,10 +79,8 @@ DEFAULT_TRAIN_CSV = os.environ.get(
 )
 
 # Folder holding model_0.pt ... model_133.pt (written by training, read by forecast).
-CHECKPOINTS = os.environ.get(
-    "SDWPF_GRU_CHECKPOINTS",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints"),
-)
+# Defaults to checkpoints/ NEXT TO THIS FILE, i.e. baseline_models/gru/checkpoints/.
+CHECKPOINTS = os.environ.get("SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "checkpoints"))
 
 # Clip negative predictions to zero. False matches the official baseline.
 CLIP_NEGATIVE = False
@@ -152,7 +149,7 @@ class Scaler(object):
         Returns:
             None
         """
-        self.mean = float(np.mean(data)) 
+        self.mean = float(np.mean(data))
         self.std = float(np.std(data))
 
     def transform(self, data):
@@ -276,11 +273,11 @@ def build_turbine_splits(data, tid, settings):
                 tid * total_size + train_size + val_size]
 
     # Fit the scaler on this turbine's TRAIN rows only.
-    scaler = Scaler() # 
-    scaler.fit(data[border1s[0]:border2s[0]]) # finds the mean and std of the training split
+    scaler = Scaler()
+    scaler.fit(data[border1s[0]:border2s[0]])
 
     train_arr = scaler.transform(data[border1s[0]:border2s[0]])
-    val_arr = scaler.transform(data[border1s[1]:border2s[1]]) # apply the same scaler to the validation split
+    val_arr = scaler.transform(data[border1s[1]:border2s[1]])
     return (TurbineWindowDataset(train_arr, input_len, output_len),
             TurbineWindowDataset(val_arr, input_len, output_len),
             scaler)
@@ -420,6 +417,9 @@ def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
             if train:
                 optimizer.zero_grad()
                 loss.backward()
+                # Clip gradients by global norm to match the official baseline,
+                # which uses paddle.nn.ClipGradByNorm(clip_norm=50.0) in common.py.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
@@ -503,7 +503,7 @@ def _load_all(capacity):
         if not os.path.exists(path):
             raise FileNotFoundError(
                 "Missing checkpoint for turbine {} at {!r}. Train it first, e.g. "
-                "python gru_baseline.py --turbines 0-133".format(tid, path))
+                "python baseline_models/gru/gru_baseline.py --turbines 0-133".format(tid, path))
         blob = torch.load(path, map_location=device, weights_only=False)
         settings = blob["settings"]
         model = BaselineGruModel(settings).to(device)
@@ -587,8 +587,8 @@ def main():
     if args.batch_size is not None:
         settings["batch_size"] = args.batch_size
 
-    device = pick_device(args.device) # choose compute device
-    turbines = parse_turbines(args.turbines, settings["capacity"]) # parse turbine selection
+    device = pick_device(args.device)
+    turbines = parse_turbines(args.turbines, settings["capacity"])
     print("device      : {}".format(device))
     print("turbines    : {} (n={})".format(
         "{}..{}".format(turbines[0], turbines[-1]) if turbines else "none", len(turbines)))
@@ -596,19 +596,19 @@ def main():
 
     print("loading training data ...")
     t0 = time.perf_counter()
-    data = load_modeled_columns(args.data, settings["start_col"]) # load CSV and replace NaN with 0
+    data = load_modeled_columns(args.data, settings["start_col"])
     print("  loaded {} rows x {} cols in {:.1f}s".format(
         data.shape[0], data.shape[1], time.perf_counter() - t0))
 
-    start_all = time.perf_counter() # start timing the whole training process
+    start_all = time.perf_counter()
     for n, tid in enumerate(turbines, 1):
-        ckpt = os.path.join(args.checkpoints, "model_{}.pt".format(tid)) # checkpoint path for this turbine
+        ckpt = os.path.join(args.checkpoints, "model_{}.pt".format(tid))
         if os.path.exists(ckpt) and not args.overwrite:
             print("[{}/{}] turbine {:3d}: checkpoint exists, skipping".format(n, len(turbines), tid))
             continue
-        t_turb = time.perf_counter() # start timing this turbine's training
+        t_turb = time.perf_counter()
         print("[{}/{}] training turbine {:3d}".format(n, len(turbines), tid))
-        best = train_one_turbine(data, tid, settings, device, args.checkpoints, seed=args.seed) # train the turbine and get the best validation loss
+        best = train_one_turbine(data, tid, settings, device, args.checkpoints, seed=args.seed)
         print("    done in {:.1f}s (best val {:.6f})".format(time.perf_counter() - t_turb, best))
 
     print("all requested turbines finished in {:.1f}s".format(time.perf_counter() - start_all))
