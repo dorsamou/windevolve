@@ -78,8 +78,7 @@ TRAIN_FILE = os.environ.get(
 # Overridable via SDWPF_LOCATION_FILE.
 LOCATION_FILE = os.environ.get(
     "SDWPF_LOCATION_FILE",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/sdwpf_baidukddcup2022_turb_location.csv",
+    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_baidukddcup2022_turb_location.csv",
 )
 
 # Score returned on ANY failure; far below any real score (~ -40..-60) so

@@ -11,3 +11,4 @@ SRIP Literature
 autoresearch_wpf
 checkpoints*
 *.joblib
+karpathy_sdwpf/logs
