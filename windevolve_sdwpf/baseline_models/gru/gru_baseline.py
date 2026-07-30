@@ -497,6 +497,9 @@ def _load_all(capacity):
     if _CACHE["models"] is not None:
         return
     device = pick_device()
+    # Announce which checkpoint folder is being used, so the scorer's output
+    # makes the source unambiguous (e.g. checkpoints vs checkpoints_clip).
+    print("[gru] loading {} checkpoints from: {}".format(capacity, CHECKPOINTS), flush=True)
     models, scalers, settings = [], [], None
     for tid in range(capacity):
         path = os.path.join(CHECKPOINTS, "model_{}.pt".format(tid))
