@@ -62,8 +62,7 @@ logger = logging.getLogger(__name__)
 # Overridable via the SDWPF_TEST_DIR environment variable.
 TEST_DIR = os.environ.get(
     "SDWPF_TEST_DIR",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/final_phase_test",
+    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/final_phase_test",
 )
 
 # Path to the 245-day training CSV. Passed to the program via envs so a candidate
@@ -72,8 +71,7 @@ TEST_DIR = os.environ.get(
 # times per evaluation). Overridable via SDWPF_TRAIN_FILE.
 TRAIN_FILE = os.environ.get(
     "SDWPF_TRAIN_FILE",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/sdwpf_245days_v1.csv",
+    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv",
 )
 
 # Path to the turbine location CSV (TurbID, x, y), enabling spatial models.

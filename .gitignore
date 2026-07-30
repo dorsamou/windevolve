@@ -9,5 +9,5 @@ __pycache__/
 PaddleSpatial-main
 SRIP Literature
 autoresearch_wpf
-checkpoints
+checkpoints*
 *.joblib
