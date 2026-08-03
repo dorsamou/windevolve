@@ -1,0 +1,93 @@
+# path: windevolve_sdwpf/ablation/config_model.yaml
+#
+# Description:
+#   MODEL-DISCOVERY arm of the ablation. Identical to config_hpo.yaml in
+#   EVERY field -- the only difference between the two arms is which seed file
+#   is passed on the command line, and therefore which region of that file the
+#   EVOLVE-BLOCK markers make mutable.
+#
+#   Keep these two files byte-identical apart from this header. If you change a
+#   knob here, change it there too, or the comparison is confounded.
+#
+# Example usage:
+#   export OPENAI_API_KEY="sk-ant-..."      # Anthropic key; OpenAI-compatible endpoint
+#   python -m openevolve.cli ablation/seed_model.py evaluator.py --config ablation/config_model.yaml
+
+max_iterations: 40             # your own ablation found convergence by ~iter 30
+checkpoint_interval: 5         # save often; a crashed run should not cost the night
+random_seed: 3
+
+llm:
+  primary_model: "claude-haiku-4-5-20251001"
+  primary_model_weight: 1.0
+  secondary_model: "claude-haiku-4-5-20251001"
+  secondary_model_weight: 0.0
+  api_base: "https://api.anthropic.com/v1/"   # Anthropic's OpenAI-compatible endpoint
+  api_key: "${OPENAI_API_KEY}"
+  temperature: 0.8
+  max_tokens: 8000
+
+prompt:
+  system_message: |
+    You are improving a Python forecaster for the KDD Cup 2022 SDWPF wind power
+    forecasting task. Only the region between the EVOLVE-BLOCK markers is yours
+    to change. Everything outside those markers is fixed and must not be touched.
+
+    CONTRACT (must not change):
+      - `envs["path_to_test_x"]` is one CSV holding 14 days of 10-minute SCADA
+        history for all 134 turbines, stacked turbine-major (turbine i is rows
+        i*2016 : (i+1)*2016). Columns: TurbID, Day, Tmstamp, Wspd, Wdir, Etmp,
+        Itmp, Ndir, Pab1, Pab2, Pab3, Prtv, Patv.
+      - forecast(envs) returns a float array of shape EXACTLY (134, 288, 1):
+        the next 288 ten-minute steps (48 hours) of active power Patv, in kW.
+      - Predictions must be >= 0, contain no NaN, and vary over the horizon.
+        All-zero, constant, or near-flat output is rejected outright.
+      - The data contains NaNs; handle them. No future weather is available.
+
+    SPEED (hard constraint):
+      forecast() is called once per validation window, many times per evaluation.
+      The seed runs in about half a second per window. Stay in that range. Prefer
+      vectorised numpy over Python loops over turbines or timesteps. An evaluation
+      that runs long is discarded and the candidate is lost.
+
+    SCORING (lower is better):
+      Per turbine, timesteps whose ground truth is missing or invalid are excluded
+      (NaN rows; Patv<0; Patv==0 while Wspd>2.5; any pitch Pab*>89; |Wdir|>180;
+      |Ndir|>720). On surviving steps, MAE and RMSE are computed in MEGAWATTS
+      (kW/1000). Per-turbine MAE and RMSE are SUMMED across the 134 turbines,
+      then averaged over windows; final score is 0.5*(RMSE + MAE). Because errors
+      SUM over turbines, a method must work on ALL turbines -- a few badly
+      predicted turbines dominate the total. RMSE punishes large misses harder
+      than MAE, so avoid big errors at high power.
+
+    DOMAIN NOTES:
+      - Power depends on wind speed through a nonlinear power curve: ~zero below a
+        cut-in speed, steeply increasing (roughly cubic) mid-range, then flat at
+        rated capacity. A linear fit on Wspd underfits badly.
+      - Patv is strongly autocorrelated: recent power is highly informative at
+        short lead times, decaying over the 48h horizon.
+      - Turbines differ (distinct power curves, some noisy or double-valued), and
+        you receive all 134 at once, so per-turbine and cross-turbine structure
+        is available.
+      - Any daily periodicity in wind is weak and site-dependent; test it rather
+        than assuming it.
+      - Pab*>89, or Patv==0 with real wind, indicates a stopped/curtailed turbine.
+
+    If you introduce anything stochastic, set an explicit random seed.
+
+database:
+  population_size: 30
+  archive_size: 12
+  num_islands: 3
+  migration_interval: 15
+  migration_rate: 0.1
+  exploration_ratio: 0.2
+  exploitation_ratio: 0.7
+
+evaluator:
+  timeout: 900                 # generous; the in-evaluator budget should fire first
+  parallel_evaluations: 1
+  cascade_evaluation: false
+
+diff_based_evolution: true
+max_code_length: 16000

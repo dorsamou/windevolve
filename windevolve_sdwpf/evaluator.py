@@ -88,6 +88,17 @@ PENALTY_COMBINED_SCORE = -1.0e6
 # valid negative scores. Warn if we get close.
 TIMEOUT_WARN_SECONDS = float(os.environ.get("SDWPF_TIMEOUT_WARN", "250"))
 
+# Hard in-evaluator wall-clock budget. MUST sit comfortably below
+# evaluator.timeout in config.yaml: if OpenEvolve's own timeout fires first the
+# candidate collapses to fitness 0.0, which OUTRANKS every valid (negative)
+# score and poisons the run. We raise instead, and evaluate() converts that into
+# PENALTY_COMBINED_SCORE like any other failure.
+EVAL_BUDGET_SECONDS = float(os.environ.get("SDWPF_EVAL_BUDGET", "600"))
+
+
+class EvalBudgetExceeded(RuntimeError):
+    """Raised when a candidate exceeds the in-evaluator wall-clock budget."""
+
 
 def _load_program(path):
     """Import a candidate program by path; must expose forecast(envs)."""
@@ -163,6 +174,11 @@ def _score_forecaster(module, val_dir, n_windows=None):
     maes, rmses, lrmses = [], [], []
     t0 = time.perf_counter()
     for w in range(n):
+        # Bail out ourselves rather than letting OpenEvolve's timeout fire.
+        if time.perf_counter() - t0 > EVAL_BUDGET_SECONDS:
+            raise EvalBudgetExceeded(
+                "exceeded {:.0f}s after {}/{} windows".format(
+                    EVAL_BUDGET_SECONDS, w, n))
         infile = infiles[w]
         pred = np.asarray(module.forecast(_prep_env(infile)))       # (134, 288, 1)
 
@@ -222,6 +238,11 @@ def evaluate(program_path, val_dir=None, n_windows=None):
         A metrics dict; combined_score is the value OpenEvolve maximizes.
     """
     vdir = val_dir if val_dir is not None else VAL_DIR
+    if n_windows is None:
+        # OpenEvolve calls evaluate(program_path) with no cap, so without this
+        # the env var only worked from the CLI and there was no way to shorten
+        # an evaluation during a search run.
+        n_windows = int(os.environ.get("SDWPF_MAX_WINDOWS", "0")) or None
     try:
         module = _load_program(program_path)
     except Exception as e:
@@ -230,6 +251,8 @@ def evaluate(program_path, val_dir=None, n_windows=None):
         return _penalty("program exposes no forecast(envs)")
     try:
         return _score_forecaster(module, vdir, n_windows=n_windows)
+    except EvalBudgetExceeded as e:
+        return _penalty("eval budget exceeded: {}".format(e))
     except om.MetricsError as e:
         # Degenerate prediction rejected by the official guards -- exactly the
         # gaming behaviour we want evolution to be penalised for.

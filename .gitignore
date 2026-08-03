@@ -12,3 +12,6 @@ autoresearch_wpf
 checkpoints*
 *.joblib
 karpathy_sdwpf/logs
+*.log
+logs
+COMPLETED
