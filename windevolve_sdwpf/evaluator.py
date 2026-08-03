@@ -76,7 +76,7 @@ LOCATION_FILE = os.environ.get(
                  "sdwpf_baidukddcup2022_turb_location.csv"))
 
 # Guard thresholds: official competition defaults.
-MIN_NON_ZERO_RATIO = float(os.environ.get("SDWPF_MIN_NON_ZERO_RATIO", "0.5"))
+MIN_NON_ZERO_RATIO = float(os.environ.get("SDWPF_MIN_NON_ZERO_RATIO", "0.9"))
 MIN_DISTINCT_RATIO = float(os.environ.get("SDWPF_MIN_DISTINCT_RATIO", "0.1"))
 
 # Returned on ANY failure; far below any real score (~ -40..-60) so a broken

@@ -12,20 +12,6 @@ Description:
       * train_one_turbine / main() -- the official training recipe + CLI
       * forecast(envs)  -- the program contract, so evaluator.py can score it
 
-    Two details are reproduced deliberately because they change the numbers:
-      1. The Scaler uses a SINGLE GLOBAL scalar mean/std over the whole 2-D
-         array (np.mean(data)), NOT per-column statistics.
-      2. That scaler is fit per turbine on THAT turbine's training split only,
-         and predictions are inverse-transformed with the same scalars.
-    NaNs are replaced by 0 before scaling, as in the original.
-
-    Deviation from the original (a pure speed win, mathematically identical):
-    each checkpoint stores the scaler statistics alongside the weights, so
-    inference never re-reads the 4.7M-row training CSV.
-
-    Predictions are NOT clipped at zero, matching the official predict.py.
-    Set CLIP_NEGATIVE = True to test that variant (a deviation from baseline).
-
 Citation:
     Port of PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/
     ({model,train,common,wind_turbine_data}.py and the submission predict.py in
@@ -36,12 +22,15 @@ Citation:
 
 Example usage:
     # Run from the package root (windevolve_sdwpf/):
-    # 1. Validate the pipeline cheaply (a few turbines, one epoch):
-    python baseline_models/gru/gru_baseline.py --turbines 0-2 --epochs 1
-    # 2. Full faithful training run (resumable; skips existing checkpoints):
-    python baseline_models/gru/gru_baseline.py --turbines 0-133 --device cuda
-    # 3. Score the trained baseline with the official metric:
-    python evaluator.py baseline_models/gru/gru_baseline.py
+    # 1. Smoke-test that it runs (3 turbines, 1 epoch, throwaway folder):
+    python baseline_models/gru/gru_baseline.py \
+        --turbines 0-2 --epochs 1 --checkpoints /tmp/gru_smoke
+    # 2. The real run -- all 134 turbines, one pass, one seed:
+    python baseline_models/gru/gru_baseline.py --device cuda
+    # 3. Score it. Inference is stochastic, so take several draws:
+    for s in 1 2 3 4 5; do
+      SDWPF_GRU_INFER_SEED=$s python evaluator.py baseline_models/gru/gru_baseline.py
+    done
 """
 import os                                    # checkpoint paths, env vars
 import sys                                   # package-root discovery
@@ -78,9 +67,17 @@ DEFAULT_TRAIN_CSV = os.environ.get(
     "sdwpf_kddcup/sdwpf_245days_v1.csv",
 )
 
+# The official global seed, set ONCE before the turbine loop
+# (common.py / train.py: fix_seed = 3407).
+OFFICIAL_FIX_SEED = 3407
+
 # Folder holding model_0.pt ... model_133.pt (written by training, read by forecast).
-# Defaults to checkpoints/ NEXT TO THIS FILE, i.e. baseline_models/gru/checkpoints/.
 CHECKPOINTS = os.environ.get("SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "checkpoints"))
+
+# Optional seed for inference. The official predict.py seeds nothing, so its
+# forecasts are irreproducible run to run; set this to make a given run
+# repeatable while keeping the dropout noise that the official code has.
+INFER_SEED = os.environ.get("SDWPF_GRU_INFER_SEED")
 
 # Clip negative predictions to zero. False matches the official baseline.
 CLIP_NEGATIVE = False
@@ -312,6 +309,15 @@ class BaselineGruModel(nn.Module):
                            num_layers=settings["lstm_layer"], batch_first=True)
         self.projection = nn.Linear(self.hidR, self.out)
 
+        # Deviation 6: paddle's nn.Linear defaults to XavierNormal weights and a
+        # ZERO bias; PyTorch defaults to U(+/-1/sqrt(fan_in)) for both. Measured
+        # on paddle 3.3.1: Linear(48,512) weight std 0.05944 vs XavierNormal's
+        # sqrt(2/(48+512)) = 0.05976, bias all-zero.
+        # The GRU's own init already matches across frameworks -- both use
+        # U(+/-1/sqrt(hidden)), verified -- so it is deliberately left alone.
+        nn.init.xavier_normal_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+
     def forward(self, x_enc):
         """
         Description:
@@ -389,10 +395,36 @@ def adjust_learning_rate(optimizer, epoch, lr):
         group["lr"] = new_lr
 
 
+def clip_gradients(model, max_norm=50.0):
+    """
+    Description:
+        Clip gradients the way the official baseline does: PER PARAMETER.
+        paddle.nn.ClipGradByNorm(50.0) bounds each parameter tensor separately.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), ...) bounds the
+        GLOBAL norm instead -- that is paddle's ClipGradByGlobalNorm, a
+        different rule -- so we clip one parameter at a time.
+        Verified on paddle 3.3.1 with gradient norms 34.641 and 173.205 at
+        clip_norm 50: ClipGradByNorm left the first untouched and clipped the
+        second to 50.000; the global rule gives 9.806 and 49.029.
+    Args:
+        model: the model whose gradients are being clipped
+        max_norm: the per-parameter norm bound (50.0, from the official settings)
+    Returns:
+        None
+    """
+    for p in model.parameters():
+        if p.grad is not None:
+            torch.nn.utils.clip_grad_norm_([p], max_norm=max_norm)
+
+
 def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
     """
     Description:
-        Run one pass over a data loader, optionally updating the model.
+        Run one pass over a data loader, optionally updating the model,
+        reproducing the official training loop exactly. Three deviations from a
+        standard PyTorch loop are deliberate and are marked inline: gradients
+        are never zeroed, the optimizer is applied twice per batch, and
+        validation runs with dropout active.
     Args:
         model: the GRU being trained or evaluated
         loader: DataLoader yielding (seq_x, seq_y) batches
@@ -404,7 +436,11 @@ def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
     Returns:
         The mean loss over the epoch as a float.
     """
-    model.train() if train else model.eval()
+    # Deviation 2: the official train.py sets model.train() at the top of each
+    # epoch and its val() never switches to eval, so the validation loss driving
+    # early stopping is computed WITH dropout active. Hence train() either way.
+    model.train()
+
     losses = []
     with torch.set_grad_enabled(train):
         for batch_x, batch_y in loader:
@@ -415,17 +451,25 @@ def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
             target = batch_y[:, -sample.shape[1]:, -out_var:]
             loss = criterion(sample, target)
             if train:
-                optimizer.zero_grad()
+                # Deviation 3: NO optimizer.zero_grad(). The official train.py
+                # never calls clear_grad() anywhere in the run, so the gradient
+                # buffer accumulates monotonically across every batch and every
+                # epoch. Verified with lr forced to 0: norms grew 1.00x, 2.00x,
+                # 3.00x, 4.00x over successive batches.
                 loss.backward()
-                # Clip gradients by global norm to match the official baseline,
-                # which uses paddle.nn.ClipGradByNorm(clip_norm=50.0) in common.py.
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=50.0)
+                clip_gradients(model)
+                optimizer.step()
+                # Deviation 4: paddle's `minimize(loss)` already applies the
+                # update and the official loop then calls `step()` too, giving
+                # two Adam applications per batch. Verified: 2.00x the weight
+                # movement of a single step.
+                clip_gradients(model)
                 optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
 
-def train_one_turbine(data, tid, settings, device, ckpt_dir, seed=42):
+def train_one_turbine(data, tid, settings, device, ckpt_dir):
     """
     Description:
         Train a single turbine's GRU with early stopping and save the best
@@ -436,16 +480,21 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir, seed=42):
         settings: hyperparameter dict from default_settings()
         device: torch device
         ckpt_dir: folder to write model_{tid}.pt into
-        seed: RNG seed for reproducible initialization
     Returns:
         The best validation loss as a float.
     """
-    torch.manual_seed(seed + tid)                  # reproducible per-turbine init
+    # Deviation 7: NO per-turbine seeding. The official seeds once
+    # (fix_seed = 3407) before the turbine loop, so each turbine continues one
+    # RNG stream and its weights depend on the turbines before it having drawn
+    # first. main() does that seeding; re-seeding here would break the stream.
     train_ds, val_ds, scaler = build_turbine_splits(data, tid, settings)
     train_loader = DataLoader(train_ds, batch_size=settings["batch_size"],
                               shuffle=True, drop_last=True)
+    # Deviation 8: the official get_data() passes shuffle=True for BOTH train
+    # and val, with drop_last=True -- so a different random subset of validation
+    # windows is discarded every epoch, adding noise to the early-stopping signal.
     val_loader = DataLoader(val_ds, batch_size=settings["batch_size"],
-                            shuffle=False, drop_last=True)
+                            shuffle=True, drop_last=True)
 
     model = BaselineGruModel(settings).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=settings["lr"])
@@ -474,14 +523,60 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir, seed=42):
         adjust_learning_rate(optimizer, epoch + 1, settings["lr"])
 
     # Persist weights AND scaler stats so inference needs no training CSV.
+    # `full_run` records whether this checkpoint came from a single pass over
+    # all 134 turbines. Deviation 7 means only such a run reproduces the
+    # official RNG stream; forecast() warns if it loads a partial one.
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save({"state_dict": best_state if best_state is not None else model.state_dict(),
                 "scaler_mean": scaler.mean,
                 "scaler_std": scaler.std,
                 "settings": settings,
+                "full_run": settings.get("_full_run", True),
                 "best_val_loss": best_val},
                os.path.join(ckpt_dir, "model_{}.pt".format(tid)))
     return best_val
+
+
+def _has_checkpoints(ckpt_dir):
+    """
+    Description:
+        Report whether a folder already holds any model_{tid}.pt files. Used to
+        detect a resumed run, which does not reproduce the official RNG stream.
+    Args:
+        ckpt_dir: folder to inspect
+    Returns:
+        True if at least one checkpoint is present.
+    """
+    if not os.path.isdir(ckpt_dir):
+        return False
+    return any(n.startswith("model_") and n.endswith(".pt") for n in os.listdir(ckpt_dir))
+
+
+def _announce(partial_turbines):
+    """
+    Description:
+        Print, once, how this baseline is being run: dropout is live at
+        inference (deviation 1), so forecast() is stochastic, and whether any
+        checkpoint came from a partial training run (deviation 7).
+    Args:
+        partial_turbines: list of turbine ids whose checkpoints are stamped as
+            coming from a run that did not cover all 134 turbines
+    Returns:
+        None
+    """
+    print("[gru] official baseline: dropout is ACTIVE at inference (the official "
+          "predict.py never calls eval()), so forecast() is STOCHASTIC -- score "
+          "several times and report mean +/- std.", flush=True)
+    if INFER_SEED is not None:
+        print("[gru] inference seeded with SDWPF_GRU_INFER_SEED={}".format(INFER_SEED),
+              flush=True)
+    if partial_turbines:
+        print("[gru] WARNING: {} checkpoint(s) came from a PARTIAL training run "
+              "(e.g. turbine {}). The official baseline seeds once (fix_seed={}) "
+              "before a single pass over all 134 turbines, so a partial run does "
+              "not reproduce its RNG stream. Fine for a smoke test; do not report "
+              "the score.".format(len(partial_turbines), partial_turbines[0],
+                                  OFFICIAL_FIX_SEED), flush=True)
 
 
 def _load_all(capacity):
@@ -500,22 +595,29 @@ def _load_all(capacity):
     # Announce which checkpoint folder is being used, so the scorer's output
     # makes the source unambiguous (e.g. checkpoints vs checkpoints_clip).
     print("[gru] loading {} checkpoints from: {}".format(capacity, CHECKPOINTS), flush=True)
-    models, scalers, settings = [], [], None
+    models, scalers, settings, partial = [], [], None, []
     for tid in range(capacity):
         path = os.path.join(CHECKPOINTS, "model_{}.pt".format(tid))
         if not os.path.exists(path):
             raise FileNotFoundError(
-                "Missing checkpoint for turbine {} at {!r}. Train it first, e.g. "
-                "python baseline_models/gru/gru_baseline.py --turbines 0-133".format(tid, path))
+                "Missing checkpoint for turbine {} at {!r}. Train it first: "
+                "python baseline_models/gru/gru_baseline.py".format(tid, path))
         blob = torch.load(path, map_location=device, weights_only=False)
         settings = blob["settings"]
         model = BaselineGruModel(settings).to(device)
         model.load_state_dict(blob["state_dict"])
-        model.eval()                       # disable dropout for inference
+        # Deviation 1: the official predict.py never calls model.eval(), and
+        # paddle Layers default to training=True, so the published 47.850 was
+        # produced with dropout ACTIVE at inference. Reproduced here, which is
+        # what makes forecast() stochastic.
+        model.train()
         models.append(model)
         scalers.append((blob["scaler_mean"], blob["scaler_std"]))
+        if not blob.get("full_run", True):
+            partial.append(tid)
     _CACHE.update({"models": models, "scalers": scalers,
                    "settings": settings, "device": device})
+    _announce(partial)
 
 
 def forecast(envs):
@@ -534,6 +636,11 @@ def forecast(envs):
     _load_all(capacity)
     models, scalers = _CACHE["models"], _CACHE["scalers"]
     settings, device = _CACHE["settings"], _CACHE["device"]
+    # In faithful mode dropout is live, so forecast() is stochastic. The
+    # official predict.py seeds nothing; SDWPF_GRU_INFER_SEED makes a given run
+    # repeatable without removing the noise.
+    if INFER_SEED is not None:
+        torch.manual_seed(int(INFER_SEED))
     input_len = settings["input_len"]
     output_len = settings["output_len"]
     out_var = settings["out_var"]
@@ -562,24 +669,29 @@ def forecast(envs):
 def main():
     """
     Description:
-        Parse arguments, load the training data once, and train the selected
-        turbines, skipping any whose checkpoint already exists.
+        Parse arguments, load the training data once, seed as the official run
+        does, and train the turbines in order.
     Args:
         None
     Returns:
         None
     """
-    parser = argparse.ArgumentParser(description="Train the per-turbine SDWPF GRU baseline")
+    parser = argparse.ArgumentParser(
+        description="Train the per-turbine SDWPF GRU baseline (official behaviour)")
     parser.add_argument("--data", type=str, default=DEFAULT_TRAIN_CSV,
                         help="Path to sdwpf_245days_v1.csv")
     parser.add_argument("--checkpoints", type=str, default=CHECKPOINTS,
                         help="Folder for model_{tid}.pt checkpoints")
     parser.add_argument("--turbines", type=str, default=None,
-                        help="Turbines to train, e.g. '0-133', '0-9', '0,5,7' (default: all)")
-    parser.add_argument("--epochs", type=int, default=None, help="Override max epochs")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+                        help="SMOKE TESTS ONLY, e.g. '0-2'. The official run covers all 134 "
+                             "turbines in one pass from a single seed, so a subset does not "
+                             "reproduce it; such checkpoints are stamped partial and scoring "
+                             "warns about them. Default: all 134")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override max epochs (official: 10). Smoke tests only")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Override batch size (official: 32). Smoke tests only")
     parser.add_argument("--device", type=str, default=None, help="cuda | mps | cpu (default: auto)")
-    parser.add_argument("--seed", type=int, default=42, help="Base RNG seed")
     parser.add_argument("--overwrite", action="store_true",
                         help="Retrain turbines whose checkpoints already exist")
     args = parser.parse_args()
@@ -592,10 +704,36 @@ def main():
 
     device = pick_device(args.device)
     turbines = parse_turbines(args.turbines, settings["capacity"])
+    full_run = (len(turbines) == settings["capacity"]) and not _has_checkpoints(args.checkpoints)
+    settings["_full_run"] = full_run
+
+    # Deviation 7: the official seeds ONCE here, before the turbine loop, so
+    # every turbine continues one RNG stream and its weights depend on the
+    # turbines before it having drawn first.
+    import random                                   # the official seeds this too
+    random.seed(OFFICIAL_FIX_SEED)
+    np.random.seed(OFFICIAL_FIX_SEED)
+    torch.manual_seed(OFFICIAL_FIX_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(OFFICIAL_FIX_SEED)
+
     print("device      : {}".format(device))
     print("turbines    : {} (n={})".format(
         "{}..{}".format(turbines[0], turbines[-1]) if turbines else "none", len(turbines)))
     print("checkpoints : {}".format(args.checkpoints))
+    print("seed        : {} (set once, before the turbine loop)".format(OFFICIAL_FIX_SEED))
+    if not full_run:
+        print("")
+        print("  *** PARTIAL RUN -- SMOKE TEST ONLY ***")
+        print("  The official baseline trains all {} turbines in a single pass from one".format(
+            settings["capacity"]))
+        print("  seed, so every turbine's weights depend on the ones before it. This run")
+        print("  covers {} turbine(s){} and therefore does NOT reproduce the official".format(
+            len(turbines), " and resumes an existing folder" if
+            _has_checkpoints(args.checkpoints) else ""))
+        print("  RNG stream. The checkpoints are stamped partial and scoring will warn.")
+        print("  For the real run: delete the checkpoint folder and pass no --turbines.")
+        print("")
 
     print("loading training data ...")
     t0 = time.perf_counter()
@@ -611,7 +749,7 @@ def main():
             continue
         t_turb = time.perf_counter()
         print("[{}/{}] training turbine {:3d}".format(n, len(turbines), tid))
-        best = train_one_turbine(data, tid, settings, device, args.checkpoints, seed=args.seed)
+        best = train_one_turbine(data, tid, settings, device, args.checkpoints)
         print("    done in {:.1f}s (best val {:.6f})".format(time.perf_counter() - t_turb, best))
 
     print("all requested turbines finished in {:.1f}s".format(time.perf_counter() - start_all))
