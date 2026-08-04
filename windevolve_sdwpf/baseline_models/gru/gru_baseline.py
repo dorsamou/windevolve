@@ -107,6 +107,13 @@ def default_settings():
         "train_size": 214,        # training days (official 245-day split)
         "val_size": 31,           # validation days
         "total_size": 245,        # days per turbine in the file
+        # NOTE: train_size/val_size/total_size describe the FILE passed to
+        # --data, not the competition's 245-day file specifically. total_size in
+        # particular is the per-turbine STRIDE used to index the flat array in
+        # build_turbine_splits(); if it disagrees with the file, every turbine
+        # after the first is read from the wrong offset and training silently
+        # trains on another turbine's data. main() therefore overrides all three
+        # from the file's actual length -- see resolve_day_sizes().
         "lstm_layer": 2,          # GRU layers
         "dropout": 0.05,          # dropout before the projection
         "capacity": 134,          # turbines
@@ -334,6 +341,83 @@ class BaselineGruModel(nn.Module):
         dec, _ = self.lstm(x_enc)                     # (B, T, hidR)
         sample = self.projection(self.dropout(dec))   # (B, T, out)
         return sample[:, -self.output_len:, -self.out:]
+
+
+def resolve_day_sizes(data, settings, train_days=None, val_days=None):
+    """
+    Description:
+        Derive total_size / train_size / val_size (all in DAYS) from the file
+        that was actually loaded, rather than trusting the 245-day defaults.
+
+        This exists because total_size doubles as the per-turbine stride in
+        build_turbine_splits(). Training on the truncated 196-day val_train.csv
+        with total_size still at 245 would index turbine t at step t*35280 in an
+        array that only has t*28224 per turbine -- every turbine but the first
+        would be fitted on a misaligned slice of somebody else's series, and
+        nothing would raise.
+
+        The inner train/val boundary is the split used for EARLY STOPPING only.
+        It is carved out of the file it is given, so when that file is
+        val_train.csv the early-stopping signal never touches the held-out
+        validation period. By default the official 214:245 proportion is
+        preserved (196 days -> 171 train / 25 early-stopping), which keeps the
+        recipe unchanged apart from having less data.
+
+    Args:
+        data: the modeled-columns array from load_modeled_columns()
+        settings: settings dict to update in place
+        train_days: explicit inner-training days (None -> official proportion)
+        val_days: explicit inner-validation days (None -> the remainder)
+    Returns:
+        The updated settings dict.
+    """
+    unit = settings["day_len"]
+    capacity = settings["capacity"]
+
+    rows = data.shape[0]
+    if rows % capacity != 0:
+        raise ValueError(
+            "file has {} rows, not divisible by capacity {} -- turbines must "
+            "have equal-length blocks".format(rows, capacity))
+    steps = rows // capacity
+    if steps % unit != 0:
+        raise ValueError(
+            "file has {} steps per turbine, not a whole number of {}-step "
+            "days".format(steps, unit))
+    total_days = steps // unit
+
+    if train_days is None and val_days is None:
+        # Preserve the official 214/245 proportion on whatever length we got.
+        train_days = int(round(total_days * 214.0 / 245.0))
+        val_days = total_days - train_days
+    elif val_days is None:
+        val_days = total_days - train_days
+    elif train_days is None:
+        train_days = total_days - val_days
+
+    if train_days <= 0 or val_days <= 0:
+        raise ValueError("train_days={} val_days={} -- both must be positive".format(
+            train_days, val_days))
+    if train_days + val_days != total_days:
+        raise ValueError(
+            "train_days ({}) + val_days ({}) = {} does not equal the file's "
+            "{} days; the borders would leave a gap or overrun".format(
+                train_days, val_days, train_days + val_days, total_days))
+
+    # Each split must hold at least one complete (input, target) window.
+    need = settings["input_len"] + settings["output_len"]
+    if train_days * unit < need:
+        raise ValueError("inner-train split ({} steps) is shorter than one "
+                         "window ({} steps)".format(train_days * unit, need))
+    # The val split starts input_len steps early, so it needs output_len more.
+    if val_days * unit + settings["input_len"] < need:
+        raise ValueError("inner-val split ({} steps) is shorter than one "
+                         "window ({} steps)".format(val_days * unit, need))
+
+    settings["total_size"] = total_days
+    settings["train_size"] = train_days
+    settings["val_size"] = val_days
+    return settings
 
 
 def pick_device(requested=None):
@@ -691,6 +775,14 @@ def main():
                         help="Override max epochs (official: 10). Smoke tests only")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size (official: 32). Smoke tests only")
+    parser.add_argument("--train-days", type=int, default=None,
+                        help="Inner-training days used for fitting. Default: the official "
+                             "214/245 proportion of whatever --data actually contains "
+                             "(245-day file -> 214; 196-day val_train.csv -> 171)")
+    parser.add_argument("--val-days", type=int, default=None,
+                        help="Inner-validation days used ONLY for early stopping. Must sum "
+                             "with --train-days to the file's day count. Default: the "
+                             "remainder (245-day file -> 31; 196-day file -> 25)")
     parser.add_argument("--device", type=str, default=None, help="cuda | mps | cpu (default: auto)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Retrain turbines whose checkpoints already exist")
@@ -740,6 +832,16 @@ def main():
     data = load_modeled_columns(args.data, settings["start_col"])
     print("  loaded {} rows x {} cols in {:.1f}s".format(
         data.shape[0], data.shape[1], time.perf_counter() - t0))
+
+    # Override the 245-day defaults with the file's real geometry. Do this
+    # BEFORE any turbine is touched: total_size is the per-turbine stride, so a
+    # stale value silently misaligns every turbine after the first.
+    resolve_day_sizes(data, settings, args.train_days, args.val_days)
+    print("split       : {} days total -> {} inner-train / {} early-stopping".format(
+        settings["total_size"], settings["train_size"], settings["val_size"]))
+    if settings["total_size"] != 245:
+        print("              (non-competition file length -- if this is val_train.csv, "
+              "the held-out period is NOT visible to training or early stopping)")
 
     start_all = time.perf_counter()
     for n, tid in enumerate(turbines, 1):
