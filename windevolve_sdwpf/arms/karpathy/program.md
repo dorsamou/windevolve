@@ -64,6 +64,13 @@ to the held-out validation windows.
 - Install new packages, or add dependencies. Use only what is already present
   in the environment. The exact package list is in `../environment.txt`; check
   there before assuming something is available.
+- Read, open, or reference any file under `val_windows/outfile/`. Those are the
+  ground-truth targets for the validation windows. Your program receives an
+  infile path and must forecast from history alone. Reading the corresponding
+  outfile — or deriving its path from the infile path — is not forecasting, and
+  invalidates the entire run. The evaluator reads the outfiles; you never do.
+- Read `official_metrics.py`, `competition_score.py`, or `test_data.py`.
+  `evaluator.py` tells you everything you need about how you are scored.
 
 **Training data**: if you fit a model, train it on `VAL_TRAIN_FILE` (the
 truncated CSV, days 1–197). Never on the full 245-day file — that contains the
