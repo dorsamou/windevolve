@@ -15,3 +15,5 @@ karpathy_sdwpf/logs
 *.log
 logs
 COMPLETED
+# karpathy arm workspace is its own git repo
+arms/karpathy/workspace/
