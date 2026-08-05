@@ -1,0 +1,349 @@
+{
+  "source_csv": "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv",
+  "n_turbines": 134,
+  "steps_per_turbine": 35280,
+  "steps_per_day": 144,
+  "input_len": 2016,
+  "output_len": 288,
+  "val_days": 48,
+  "val_start_step": 28368,
+  "train_rows_per_turbine": 28368,
+  "windows": [
+    {
+      "index": 1,
+      "infile": "0001in.csv",
+      "outfile": "0001out.csv",
+      "history_steps": [
+        26352,
+        28368
+      ],
+      "target_steps": [
+        28368,
+        28656
+      ],
+      "target_day": 198
+    },
+    {
+      "index": 2,
+      "infile": "0002in.csv",
+      "outfile": "0002out.csv",
+      "history_steps": [
+        26640,
+        28656
+      ],
+      "target_steps": [
+        28656,
+        28944
+      ],
+      "target_day": 200
+    },
+    {
+      "index": 3,
+      "infile": "0003in.csv",
+      "outfile": "0003out.csv",
+      "history_steps": [
+        26928,
+        28944
+      ],
+      "target_steps": [
+        28944,
+        29232
+      ],
+      "target_day": 202
+    },
+    {
+      "index": 4,
+      "infile": "0004in.csv",
+      "outfile": "0004out.csv",
+      "history_steps": [
+        27216,
+        29232
+      ],
+      "target_steps": [
+        29232,
+        29520
+      ],
+      "target_day": 204
+    },
+    {
+      "index": 5,
+      "infile": "0005in.csv",
+      "outfile": "0005out.csv",
+      "history_steps": [
+        27504,
+        29520
+      ],
+      "target_steps": [
+        29520,
+        29808
+      ],
+      "target_day": 206
+    },
+    {
+      "index": 6,
+      "infile": "0006in.csv",
+      "outfile": "0006out.csv",
+      "history_steps": [
+        27792,
+        29808
+      ],
+      "target_steps": [
+        29808,
+        30096
+      ],
+      "target_day": 208
+    },
+    {
+      "index": 7,
+      "infile": "0007in.csv",
+      "outfile": "0007out.csv",
+      "history_steps": [
+        28080,
+        30096
+      ],
+      "target_steps": [
+        30096,
+        30384
+      ],
+      "target_day": 210
+    },
+    {
+      "index": 8,
+      "infile": "0008in.csv",
+      "outfile": "0008out.csv",
+      "history_steps": [
+        28368,
+        30384
+      ],
+      "target_steps": [
+        30384,
+        30672
+      ],
+      "target_day": 212
+    },
+    {
+      "index": 9,
+      "infile": "0009in.csv",
+      "outfile": "0009out.csv",
+      "history_steps": [
+        28656,
+        30672
+      ],
+      "target_steps": [
+        30672,
+        30960
+      ],
+      "target_day": 214
+    },
+    {
+      "index": 10,
+      "infile": "0010in.csv",
+      "outfile": "0010out.csv",
+      "history_steps": [
+        28944,
+        30960
+      ],
+      "target_steps": [
+        30960,
+        31248
+      ],
+      "target_day": 216
+    },
+    {
+      "index": 11,
+      "infile": "0011in.csv",
+      "outfile": "0011out.csv",
+      "history_steps": [
+        29232,
+        31248
+      ],
+      "target_steps": [
+        31248,
+        31536
+      ],
+      "target_day": 218
+    },
+    {
+      "index": 12,
+      "infile": "0012in.csv",
+      "outfile": "0012out.csv",
+      "history_steps": [
+        29520,
+        31536
+      ],
+      "target_steps": [
+        31536,
+        31824
+      ],
+      "target_day": 220
+    },
+    {
+      "index": 13,
+      "infile": "0013in.csv",
+      "outfile": "0013out.csv",
+      "history_steps": [
+        29808,
+        31824
+      ],
+      "target_steps": [
+        31824,
+        32112
+      ],
+      "target_day": 222
+    },
+    {
+      "index": 14,
+      "infile": "0014in.csv",
+      "outfile": "0014out.csv",
+      "history_steps": [
+        30096,
+        32112
+      ],
+      "target_steps": [
+        32112,
+        32400
+      ],
+      "target_day": 224
+    },
+    {
+      "index": 15,
+      "infile": "0015in.csv",
+      "outfile": "0015out.csv",
+      "history_steps": [
+        30384,
+        32400
+      ],
+      "target_steps": [
+        32400,
+        32688
+      ],
+      "target_day": 226
+    },
+    {
+      "index": 16,
+      "infile": "0016in.csv",
+      "outfile": "0016out.csv",
+      "history_steps": [
+        30672,
+        32688
+      ],
+      "target_steps": [
+        32688,
+        32976
+      ],
+      "target_day": 228
+    },
+    {
+      "index": 17,
+      "infile": "0017in.csv",
+      "outfile": "0017out.csv",
+      "history_steps": [
+        30960,
+        32976
+      ],
+      "target_steps": [
+        32976,
+        33264
+      ],
+      "target_day": 230
+    },
+    {
+      "index": 18,
+      "infile": "0018in.csv",
+      "outfile": "0018out.csv",
+      "history_steps": [
+        31248,
+        33264
+      ],
+      "target_steps": [
+        33264,
+        33552
+      ],
+      "target_day": 232
+    },
+    {
+      "index": 19,
+      "infile": "0019in.csv",
+      "outfile": "0019out.csv",
+      "history_steps": [
+        31536,
+        33552
+      ],
+      "target_steps": [
+        33552,
+        33840
+      ],
+      "target_day": 234
+    },
+    {
+      "index": 20,
+      "infile": "0020in.csv",
+      "outfile": "0020out.csv",
+      "history_steps": [
+        31824,
+        33840
+      ],
+      "target_steps": [
+        33840,
+        34128
+      ],
+      "target_day": 236
+    },
+    {
+      "index": 21,
+      "infile": "0021in.csv",
+      "outfile": "0021out.csv",
+      "history_steps": [
+        32112,
+        34128
+      ],
+      "target_steps": [
+        34128,
+        34416
+      ],
+      "target_day": 238
+    },
+    {
+      "index": 22,
+      "infile": "0022in.csv",
+      "outfile": "0022out.csv",
+      "history_steps": [
+        32400,
+        34416
+      ],
+      "target_steps": [
+        34416,
+        34704
+      ],
+      "target_day": 240
+    },
+    {
+      "index": 23,
+      "infile": "0023in.csv",
+      "outfile": "0023out.csv",
+      "history_steps": [
+        32688,
+        34704
+      ],
+      "target_steps": [
+        34704,
+        34992
+      ],
+      "target_day": 242
+    },
+    {
+      "index": 24,
+      "infile": "0024in.csv",
+      "outfile": "0024out.csv",
+      "history_steps": [
+        32976,
+        34992
+      ],
+      "target_steps": [
+        34992,
+        35280
+      ],
+      "target_day": 244
+    }
+  ]
+}
