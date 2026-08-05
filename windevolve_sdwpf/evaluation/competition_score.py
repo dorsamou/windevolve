@@ -69,8 +69,17 @@ import importlib.util             # load the forecaster by path
 
 import numpy as np                 # arrays
 
+# Loaded by path in some workflows; add this directory (sibling scorer
+# modules) and the repo root (paths.py) to sys.path explicitly.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from test_data import TestData     # official per-window loader (faithful copy)
 import official_metrics as om      # the REAL competition grader, verbatim
+from paths import TEST_DIR, TRAIN_FILE, LOCATION_FILE
 
 # --- evaluation.py: initiate_env() ------------------------------------------
 CAPACITY, OUTPUT_LEN, OUT_VAR, START_COL, DAY_LEN = 134, 288, 1, 3, 144
@@ -82,18 +91,6 @@ NUM_MAX_RUNS = int(os.environ.get("SDWPF_NUM_MAX_RUNS", "142"))
 MAX_TIMEOUT = float(os.environ.get("SDWPF_MAX_TIMEOUT", str(3600 * 10)))  # 10 hours
 MIN_TIME = 3                # 3 secs
 MIN_NOISE_LEVEL = 0.05      # 5 %
-
-TEST_DIR = os.environ.get(
-    "SDWPF_TEST_DIR",
-    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/final_phase_test")
-TRAIN_FILE = os.environ.get(
-    "SDWPF_TRAIN_FILE",
-    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv")
-LOCATION_FILE = os.environ.get(
-    "SDWPF_LOCATION_FILE",
-    "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/"
-    "sdwpf_baidukddcup2022_turb_location.csv")
-
 
 class EvaluationError(Exception):
     """

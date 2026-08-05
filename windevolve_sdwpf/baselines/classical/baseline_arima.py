@@ -46,16 +46,17 @@ DEFAULT_ORDER = (1, 1, 1)
 FIT_STEPS = 245 * DAY_LEN
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from paths import VAL_TRAIN_FILE
 
 # Where the fitted per-turbine models are written / read from.
 MODEL_PATH = os.environ.get("SDWPF_ARIMA_MODEL", os.path.join(_HERE, "arima_models.joblib"))
 
-# The 245-day training CSV.
-TRAIN_CSV = os.environ.get(
-    "SDWPF_TRAIN_FILE",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/sdwpf_245days_v1.csv",
-)
+# Truncated training csv -- see note in paths.py. Fitting on the full 245-day
+# file would leak the validation period into the model.
+TRAIN_CSV = VAL_TRAIN_FILE
 
 _CACHE = {"fits": None}       # module-level cache; forecast() runs 142 times
 

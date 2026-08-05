@@ -55,10 +55,17 @@ import argparse                    # CLI
 import numpy as np                 # index maths
 import pandas as pd                # CSV read/write
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from paths import SPLITS_DIR, TRAIN_FILE as DEFAULT_TRAIN_FILE
+
 CAPACITY = 134                     # turbines
 STEPS_PER_DAY = 144                # 10-minute steps per day
 INPUT_LEN = 2016                   # 14 days of history per window (official)
 OUTPUT_LEN = 288                   # 48 hour horizon (official)
+
 
 # The official column order. The first three are labels (start_col=3 in
 # test_data.py); everything from Wspd on is modeled, and Patv is the target.
@@ -344,13 +351,13 @@ def verify(args):
 
 def main():
     ap = argparse.ArgumentParser(description="Build the SDWPF validation split.")
-    ap.add_argument("--train-file", help="the 245-day SDWPF training CSV")
-    ap.add_argument("--out-dir", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "val_split"))
-    ap.add_argument("--n-windows", type=int, default=48,
-                    help="number of validation windows (default 48)")
-    ap.add_argument("--val-days", type=int, default=30,
-                    help="size of the validation period in days (default 30)")
+    ap.add_argument("--train-file", default=DEFAULT_TRAIN_FILE,
+                    help="the 245-day SDWPF training CSV (default: paths.TRAIN_FILE)")
+    ap.add_argument("--out-dir", default=SPLITS_DIR)    
+    ap.add_argument("--n-windows", type=int, default=24,
+                    help="number of validation windows (default 24)")
+    ap.add_argument("--val-days", type=int, default=48,
+                    help="size of the validation period in days (default 48)")
     ap.add_argument("--input-len", type=int, default=INPUT_LEN)
     ap.add_argument("--output-len", type=int, default=OUTPUT_LEN)
     ap.add_argument("--capacity", type=int, default=CAPACITY)

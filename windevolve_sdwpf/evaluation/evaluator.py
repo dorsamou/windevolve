@@ -52,28 +52,20 @@ import importlib.util             # load candidate by path
 
 import numpy as np                 # arrays
 
+# This file is loaded BY PATH (OpenEvolve uses importlib.util), which does not
+# put its own directory on sys.path. Add this directory -- for the sibling
+# scorer modules -- and the repo root -- for paths.py -- explicitly.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_HERE, _ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 from test_data import TestData     # official per-window loader (faithful copy)
 import official_metrics as om      # the REAL competition grader, verbatim
+from paths import VAL_DIR, VAL_TRAIN_FILE, LOCATION_FILE
 
 CAPACITY, OUTPUT_LEN, OUT_VAR, START_COL, DAY_LEN = 134, 288, 1, 3, 144
-
-# ---------------------------------------------------------------------------
-# The evolve loop scores on the VALIDATION split, not final_phase_test.
-# val_windows.py writes <repo>/val_split/val_windows (infile/ + outfile/) and
-# <repo>/val_split/val_train.csv. Both are overridable via env vars.
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_VAL_DIR = os.path.join(_HERE, "val_split", "val_windows")
-_DEFAULT_VAL_TRAIN = os.path.join(_HERE, "val_split", "val_train.csv")
-
-VAL_DIR = os.environ.get("SDWPF_VAL_WINDOWS", _DEFAULT_VAL_DIR)
-# Candidates that fit a model must train on the TRUNCATED csv (pre-val rows
-# only), never the full 245 days -- otherwise they see their own val targets.
-VAL_TRAIN_FILE = os.environ.get("SDWPF_VAL_TRAIN", _DEFAULT_VAL_TRAIN)
-LOCATION_FILE = os.environ.get(
-    "SDWPF_LOCATION_FILE",
-    os.path.join(_HERE, "..", "wind_forecasting_data", "sdwpf_kddcup",
-                 "sdwpf_baidukddcup2022_turb_location.csv"))
 
 # Guard thresholds: official competition defaults.
 MIN_NON_ZERO_RATIO = float(os.environ.get("SDWPF_MIN_NON_ZERO_RATIO", "0.9"))

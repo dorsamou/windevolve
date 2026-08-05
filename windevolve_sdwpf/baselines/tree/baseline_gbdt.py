@@ -49,6 +49,7 @@ Example usage:
 import os                                  # paths and env vars
 import time                                # training timers
 import argparse                            # training CLI
+import sys
 
 import numpy as np                         # feature construction
 import pandas as pd                        # CSV reading
@@ -61,16 +62,17 @@ DAY_LEN = 144                 # steps per day
 START_COL = 3                 # first modeled column (Wspd); Patv is the target
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from paths import VAL_TRAIN_FILE
 
 # Where the fitted model is written / read from (next to this file).
 MODEL_PATH = os.environ.get("SDWPF_GBDT_MODEL", os.path.join(_HERE, "gbdt_model.joblib"))
 
-# The 245-day training CSV.
-TRAIN_CSV = os.environ.get(
-    "SDWPF_TRAIN_FILE",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/sdwpf_245days_v1.csv",
-)
+# Truncated training csv -- see note in paths.py. Fitting on the full 245-day
+# file would leak the validation period into the model.
+TRAIN_CSV = VAL_TRAIN_FILE
 
 # The feature names, in the fixed column order used everywhere below.
 FEATURES = ["h", "hour_of_day", "patv_last", "patv_mean_1h", "patv_mean_6h",

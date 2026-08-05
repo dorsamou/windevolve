@@ -43,29 +43,25 @@ import torch                                 # model + training
 import torch.nn as nn                        # layers and loss
 from torch.utils.data import Dataset, DataLoader
 
-# This file lives in a subfolder (baseline_models/gru/), but test_data.py lives
-# at the package root. Walk up until we find it, then put that on sys.path so
-# the import works whether this file is run directly or loaded by evaluator.py.
+# baselines/gru/ -> baselines/ -> repo root. Add the repo root (paths.py) and
+# evaluation/ (test_data.py) so imports work whether this file is run directly
+# or loaded by path from the evaluator.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = _HERE
-for _ in range(4):
-    if os.path.exists(os.path.join(_ROOT, "test_data.py")):
-        break
-    _ROOT = os.path.dirname(_ROOT)
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_ROOT = os.path.dirname(os.path.dirname(_HERE))
+for _p in (_ROOT, os.path.join(_ROOT, "evaluation")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from test_data import TestData               # official per-turbine window loader
+from paths import VAL_TRAIN_FILE
 
 DAY_LEN = 144        # 10-minute observations per day
 START_COL = 3        # first modeled column (Wspd); 0-2 are TurbID/Day/Tmstamp
 
 # Default location of the 245-day training CSV (override with --data).
-DEFAULT_TRAIN_CSV = os.environ.get(
-    "SDWPF_TRAIN_FILE",
-    "/Users/dorsam/Documents/SRIP 2026/wind_forecasting_data/SDWPF_dataset/"
-    "sdwpf_kddcup/sdwpf_245days_v1.csv",
-)
+# The TRUNCATED training csv (pre-validation rows only). Never the full 245
+# days -- that would train on the validation targets this model is scored on.
+DEFAULT_TRAIN_CSV = VAL_TRAIN_FILE
 
 # The official global seed, set ONCE before the turbine loop
 # (common.py / train.py: fix_seed = 3407).
