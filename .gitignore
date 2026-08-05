@@ -15,3 +15,6 @@ karpathy_sdwpf/logs
 *.log
 logs
 COMPLETED
+*/baselines/bigscity/vendor/
+# karpathy workspace is its own git repo, pushed separately
+windevolve_sdwpf/arms/karpathy/workspace/
