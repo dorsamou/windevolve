@@ -15,8 +15,8 @@ To set up a new experiment, work with the user to:
    standalone git repository. All git commands you run apply only here.
 3. **Read the in-scope files**:
    - `forecaster.py` — the file you modify. The forecasting logic.
-   - `../../../evaluation/evaluator.py` — how you are scored. **Read it.**
-     Do not modify it.
+   - `../../../evaluation/evaluator.py` — how you are scored. Read it. Do not
+     modify it, and do not follow its imports into the other scorer files.
 4. **Verify the split exists**: run `python ../../../paths.py` and confirm
    `VAL_DIR` and `VAL_TRAIN_FILE` both report `[ok]`. If either is MISSING,
    stop and tell the user to generate the split first — you cannot score

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-path: windevolve_sdwpf/baseline_models/tree/baseline_gbdt.py
+path: windevolve_sdwpf/baselines/tree/baseline_gbdt.py
 
 Description:
     Tier-2 machine-learning baseline: gradient boosted decision trees (XGBoost).
@@ -16,21 +16,32 @@ Description:
     h = 1..288 and the model is called once per turbine, so the full 48h
     trajectory is produced directly (no recursion, so no error compounding).
 
-    This is the first baseline that reads WIND SPEED, which drives power through
-    the nonlinear power curve. Trees represent that curve naturally by splitting
-    the wind-speed axis into regions -- something a linear model (ARIMA) cannot
-    do -- which is the main reason a tree model can beat the naive/ARIMA floor.
+    FEATURE SETS. The feature list is not fixed. FEATURE_SET selects one of six
+    NESTED tiers, each a strict superset of the one before, so the difference
+    between two adjacent tiers isolates exactly what the added information is
+    worth:
 
-    Features (all derived from history at or before the origin -- never future):
-      h                  horizon step, 1..288
-      hour_of_day        time of day at the predicted step (captures diurnal shape)
-      patv_last          power at the origin
-      patv_mean_1h/6h/24h  recent mean power over 6/36/144 steps
-      patv_std_24h       recent variability
-      wspd_last          wind speed at the origin
-      wspd_mean_6h/24h   recent mean wind speed
-      patv_yesterday     power one day before the predicted step
-      patv_turbine_mean  the turbine's own mean power (a capacity proxy)
+        power       own past power and time only -- NO wind speed
+        base        + wind speed  (the original 12 features; the reference)
+        turbine     + the turbine's other channels: direction, temperatures,
+                      pitch angles, reactive power, a parked-fraction flag
+        farm        + farm-wide aggregates at the origin (all 134 turbines)
+        neighbour   + the k nearest turbines' power and wind speed
+        xy          + the turbine's raw x/y coordinates
+
+    `power` vs `base` measures what wind speed buys. `farm` and `neighbour`
+    are the SPATIAL tiers, and they answer whether turbine layout carries
+    anything the competition's spatial entrants were after.
+
+    A WARNING ABOUT THE `xy` TIER. Each turbine has unique coordinates, so x/y
+    is a turbine IDENTIFIER in disguise. A tree given x/y can memorise
+    per-turbine behaviour, which quietly converts the global model into 134
+    per-turbine models and destroys the one property that makes this baseline
+    the right comparator for the generalisation question. It is included
+    because the comparison is informative, and it must be reported separately
+    rather than folded into "the tuned XGBoost". `farm` and `neighbour` do not
+    have this problem: both are aggregates over OTHER turbines and carry no
+    identity.
 
 Citation:
     Program contract and scoring follow the official Baidu KDD Cup 2022 SDWPF
@@ -41,10 +52,13 @@ Citation:
 
 Example usage:
     # Run from the package root (windevolve_sdwpf/):
-    # 1. Train the global model on the 245-day CSV (writes gbdt_model.joblib):
-    python baseline_models/tree/baseline_gbdt.py --origins 150
+    # 1. Train the global model (writes gbdt_model.joblib):
+    python baselines/tree/baseline_gbdt.py --origins 150
+    python baselines/tree/baseline_gbdt.py --features neighbour --origins 150
     # 2. Score it with the official metric:
-    python evaluator.py baseline_models/tree/baseline_gbdt.py
+    python evaluation/evaluator.py baselines/tree/baseline_gbdt.py
+    # 3. Or sweep every tier at once:
+    python analysis/sweep.py gbdt --only features
 """
 import os                                  # paths and env vars
 import time                                # training timers
@@ -65,7 +79,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from paths import VAL_TRAIN_FILE
+from paths import VAL_TRAIN_FILE, LOCATION_FILE
 
 # Where the fitted model is written / read from (next to this file).
 MODEL_PATH = os.environ.get("SDWPF_GBDT_MODEL", os.path.join(_HERE, "gbdt_model.joblib"))
@@ -74,103 +88,287 @@ MODEL_PATH = os.environ.get("SDWPF_GBDT_MODEL", os.path.join(_HERE, "gbdt_model.
 # file would leak the validation period into the model.
 TRAIN_CSV = VAL_TRAIN_FILE
 
-# The feature names, in the fixed column order used everywhere below.
-FEATURES = ["h", "hour_of_day", "patv_last", "patv_mean_1h", "patv_mean_6h",
-            "patv_mean_24h", "patv_std_24h", "wspd_last", "wspd_mean_6h",
-            "wspd_mean_24h", "patv_yesterday", "patv_turbine_mean"]
+# Which nested feature tier to use. "base" reproduces the original 12 features
+# exactly and is the reference configuration.
+FEATURE_SET = os.environ.get("SDWPF_GBDT_FEATURES", "base")
 
-_CACHE = {"model": None}      # module-level cache; forecast() runs 142 times
+# How many nearest turbines the "neighbour" tier aggregates over.
+K_NEIGHBOURS = int(os.environ.get("SDWPF_GBDT_K", "5"))
+
+# ---------------------------------------------------------------------------
+# Feature tiers. Nested by SET, and `base` keeps the ORIGINAL column order so a
+# model retrained at the reference configuration is identical to the one that
+# produced the previously reported number -- a reordering would perturb which
+# columns colsample_bytree draws and move the score for no reason.
+# ---------------------------------------------------------------------------
+_BASE = ["h", "hour_of_day", "patv_last", "patv_mean_1h", "patv_mean_6h",
+         "patv_mean_24h", "patv_std_24h", "wspd_last", "wspd_mean_6h",
+         "wspd_mean_24h", "patv_yesterday", "patv_turbine_mean"]
+
+_INC_TURBINE = ["wdir_sin", "wdir_cos", "etmp_last", "itmp_last",
+                "pab_max_last", "prtv_last", "zero_frac_24h", "wspd_std_24h",
+                "patv_mean_48h", "wspd_yesterday"]
+_INC_FARM = ["farm_patv_now", "farm_wspd_now", "farm_patv_24h", "turbine_share"]
+_INC_NEIGHBOUR = ["nbr_patv_last", "nbr_wspd_last", "nbr_wspd_mean_6h"]
+_INC_XY = ["turb_x", "turb_y"]
+
+_TIER_FEATURES = {
+    # `power` is `base` with the three wind-speed columns removed, so the
+    # difference between the two is exactly what wind speed is worth.
+    "power": [f for f in _BASE if not f.startswith("wspd")],
+    "base": list(_BASE),
+    "turbine": _BASE + _INC_TURBINE,
+    "farm": _BASE + _INC_TURBINE + _INC_FARM,
+    "neighbour": _BASE + _INC_TURBINE + _INC_FARM + _INC_NEIGHBOUR,
+    "xy": _BASE + _INC_TURBINE + _INC_FARM + _INC_NEIGHBOUR + _INC_XY,
+}
+TIERS = ["power", "base", "turbine", "farm", "neighbour", "xy"]
 
 
-def _build_features(patv, wspd, origin, horizons, turbine_mean):
+def feature_names(feature_set=None):
+    """
+    Description:
+        The ordered feature list for one tier.
+    Args:
+        feature_set: tier name (defaults to the module-level FEATURE_SET)
+    Returns:
+        A list of feature names, in the fixed column order used everywhere.
+    """
+    want = feature_set or FEATURE_SET
+    if want not in _TIER_FEATURES:
+        raise ValueError("unknown feature set {!r}; choose from {}".format(want, TIERS))
+    return list(_TIER_FEATURES[want])
+
+
+# The original 12, kept as a name so older callers and the docs still resolve.
+FEATURES = feature_names("base")
+
+_CACHE = {"model": None, "features": None, "feature_set": None, "k": K_NEIGHBOURS}
+
+
+# ---------------------------------------------------------------------------
+# Farm context: everything a feature might need, loaded once per CSV
+# ---------------------------------------------------------------------------
+def _read_locations(location_file=None):
+    """Read the turbine layout, sorted by TurbID. Returns None if unavailable."""
+    path = location_file or LOCATION_FILE
+    if not path or not os.path.exists(path):
+        return None
+    loc = pd.read_csv(path)
+    cols = {c.lower(): c for c in loc.columns}
+    xc, yc = cols.get("x"), cols.get("y")
+    if xc is None or yc is None:
+        return None
+    key = cols.get("turbid", loc.columns[0])
+    loc = loc.sort_values(key).reset_index(drop=True)
+    return loc[[xc, yc]].to_numpy(dtype=np.float32)
+
+
+def _neighbour_index(capacity, k, location_file=None):
+    """
+    Description:
+        For each turbine, the indices of its k nearest turbines by Euclidean
+        distance in the farm layout. A turbine is never its own neighbour.
+    Args:
+        capacity: number of turbines
+        k: neighbours per turbine
+        location_file: path to the turbine location CSV
+    Returns:
+        An integer array of shape (capacity, k), or None if no layout is found.
+    """
+    xy = _read_locations(location_file)
+    if xy is None:
+        return None
+    xy = xy[:capacity]
+    d = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=-1)
+    np.fill_diagonal(d, np.inf)                      # never your own neighbour
+    return np.argsort(d, axis=1)[:, :k]
+
+
+def build_context(df, capacity, feature_set=None, k=None, location_file=None):
+    """
+    Description:
+        Reshape one CSV into per-turbine channel arrays and precompute
+        everything the requested tier needs. Channels beyond power and wind
+        speed are only read when the tier asks for them, so the cheap tiers stay
+        cheap.
+    Args:
+        df: the loaded CSV (turbine-major, 13 official columns)
+        capacity: number of turbines
+        feature_set: tier name
+        k: neighbours per turbine
+        location_file: path to the turbine location CSV
+    Returns:
+        A context dict consumed by _build_features().
+    """
+    want = feature_set or FEATURE_SET
+    k = K_NEIGHBOURS if k is None else k
+    names = set(feature_names(want))
+    total = len(df) // capacity
+
+    def chan(col):
+        a = np.nan_to_num(df[col].to_numpy(dtype=np.float32), nan=0.0)
+        return a.reshape(capacity, total)
+
+    ctx = {"total": total, "capacity": capacity, "feature_set": want,
+           "patv": chan("Patv"), "wspd": chan("Wspd")}
+    ctx["turbine_mean"] = ctx["patv"].mean(axis=1)
+
+    if "wdir_sin" in names:
+        ctx["wdir"] = chan("Wdir")
+        ctx["etmp"] = chan("Etmp")
+        ctx["itmp"] = chan("Itmp")
+        ctx["prtv"] = chan("Prtv")
+        ctx["pab"] = np.maximum(np.maximum(chan("Pab1"), chan("Pab2")), chan("Pab3"))
+    if "farm_patv_now" in names:
+        ctx["farm_patv"] = ctx["patv"].mean(axis=0)          # (total,)
+        ctx["farm_wspd"] = ctx["wspd"].mean(axis=0)
+        ctx["farm_mean"] = float(ctx["patv"].mean())
+    if "nbr_patv_last" in names:
+        ctx["nbr"] = _neighbour_index(capacity, k, location_file)
+        if ctx["nbr"] is None:
+            raise FileNotFoundError(
+                "the {!r} feature tier needs the turbine location file; looked "
+                "at {!r}".format(want, location_file or LOCATION_FILE))
+    if "turb_x" in names:
+        xy = _read_locations(location_file)
+        if xy is None:
+            raise FileNotFoundError(
+                "the {!r} feature tier needs the turbine location file".format(want))
+        ctx["xy"] = xy[:capacity]
+    return ctx
+
+
+def _build_features(ctx, t, origin, horizons):
     """
     Description:
         Build the feature matrix for one turbine at one forecast origin, for the
-        requested horizon steps. Uses only data at or before the origin.
+        requested horizon steps. Uses only data at or before the origin -- for
+        this turbine and, in the spatial tiers, for the others too.
     Args:
-        patv: 1-D array of this turbine's power history (NaNs already zeroed)
-        wspd: 1-D array of this turbine's wind speed history
-        origin: index of the forecast origin within those arrays
+        ctx: context from build_context()
+        t: turbine index
+        origin: index of the forecast origin within the series
         horizons: 1-D integer array of horizon steps (1-based)
-        turbine_mean: this turbine's mean power over the available history
     Returns:
-        A float array of shape (len(horizons), len(FEATURES)).
+        A float32 array of shape (len(horizons), n_features).
     """
-    hist_p = patv[:origin + 1]                    # power up to and including the origin
-    hist_w = wspd[:origin + 1]                    # wind speed up to the origin
-    patv_last = hist_p[-1]                         # power right at the origin
-    patv_mean_1h = hist_p[-6:].mean()             # last hour (6 steps)
-    patv_mean_6h = hist_p[-36:].mean()            # last 6 hours
-    patv_mean_24h = hist_p[-DAY_LEN:].mean()      # last day
-    patv_std_24h = hist_p[-DAY_LEN:].std()        # last day's variability
-    wspd_last = hist_w[-1]                         # wind speed at the origin
-    wspd_mean_6h = hist_w[-36:].mean()
-    wspd_mean_24h = hist_w[-DAY_LEN:].mean()
+    names = feature_names(ctx["feature_set"])
+    patv, wspd = ctx["patv"], ctx["wspd"]
+    p, w = patv[t], wspd[t]
+    hist_p, hist_w = p[:origin + 1], w[:origin + 1]
 
+    patv_mean_24h = hist_p[-DAY_LEN:].mean()
     n = len(horizons)
+    ones = np.ones(n, dtype=np.float32)
+
     # Power one day before each predicted step; where that index is before the
     # start of history, fall back to the recent daily mean.
-    yesterday_idx = origin + horizons - DAY_LEN
-    patv_yesterday = np.where(yesterday_idx >= 0,
-                              patv[np.clip(yesterday_idx, 0, len(patv) - 1)],
-                              patv_mean_24h)
-    hour_of_day = ((origin + horizons) % DAY_LEN) / 6.0    # 0..24 in hours
+    yidx = origin + horizons - DAY_LEN
+    inb = yidx >= 0
+    clipped = np.clip(yidx, 0, len(p) - 1)
 
-    X = np.empty((n, len(FEATURES)), dtype=np.float32)
-    X[:, 0] = horizons                 # h
-    X[:, 1] = hour_of_day
-    X[:, 2] = patv_last
-    X[:, 3] = patv_mean_1h
-    X[:, 4] = patv_mean_6h
-    X[:, 5] = patv_mean_24h
-    X[:, 6] = patv_std_24h
-    X[:, 7] = wspd_last
-    X[:, 8] = wspd_mean_6h
-    X[:, 9] = wspd_mean_24h
-    X[:, 10] = patv_yesterday
-    X[:, 11] = turbine_mean
+    f = {}
+    f["h"] = horizons.astype(np.float32)
+    f["hour_of_day"] = ((origin + horizons) % DAY_LEN) / 6.0
+    f["patv_last"] = ones * hist_p[-1]
+    f["patv_mean_1h"] = ones * hist_p[-6:].mean()
+    f["patv_mean_6h"] = ones * hist_p[-36:].mean()
+    f["patv_mean_24h"] = ones * patv_mean_24h
+    f["patv_std_24h"] = ones * hist_p[-DAY_LEN:].std()
+    f["patv_yesterday"] = np.where(inb, p[clipped], patv_mean_24h)
+    f["patv_turbine_mean"] = ones * ctx["turbine_mean"][t]
+
+    if "wspd_last" in names:
+        f["wspd_last"] = ones * hist_w[-1]
+        f["wspd_mean_6h"] = ones * hist_w[-36:].mean()
+        f["wspd_mean_24h"] = ones * hist_w[-DAY_LEN:].mean()
+
+    if "wdir_sin" in names:
+        # Direction is circular: 359 deg and 1 deg are one degree apart, but as
+        # a raw number they are 358 apart and a tree would have to spend splits
+        # rediscovering that. sin/cos removes the discontinuity.
+        wd = np.deg2rad(float(ctx["wdir"][t][origin]))
+        f["wdir_sin"] = ones * np.sin(wd)
+        f["wdir_cos"] = ones * np.cos(wd)
+        f["etmp_last"] = ones * ctx["etmp"][t][origin]
+        f["itmp_last"] = ones * ctx["itmp"][t][origin]
+        # Pitch angle: blades feathered means the turbine is deliberately
+        # spilling wind. The strongest available signal for "this turbine is
+        # currently not producing and will probably stay that way".
+        f["pab_max_last"] = ones * ctx["pab"][t][origin]
+        f["prtv_last"] = ones * ctx["prtv"][t][origin]
+        f["zero_frac_24h"] = ones * float((hist_p[-DAY_LEN:] <= 0).mean())
+        f["wspd_std_24h"] = ones * hist_w[-DAY_LEN:].std()
+        f["patv_mean_48h"] = ones * hist_p[-2 * DAY_LEN:].mean()
+        f["wspd_yesterday"] = np.where(inb, w[clipped], hist_w[-DAY_LEN:].mean())
+
+    if "farm_patv_now" in names:
+        lo24 = max(0, origin - DAY_LEN + 1)
+        f["farm_patv_now"] = ones * ctx["farm_patv"][origin]
+        f["farm_wspd_now"] = ones * ctx["farm_wspd"][origin]
+        f["farm_patv_24h"] = ones * ctx["farm_patv"][lo24:origin + 1].mean()
+        denom = ctx["farm_mean"] if ctx["farm_mean"] else 1.0
+        f["turbine_share"] = ones * (ctx["turbine_mean"][t] / denom)
+
+    if "nbr_patv_last" in names:
+        nb = ctx["nbr"][t]
+        lo6 = max(0, origin - 36 + 1)
+        f["nbr_patv_last"] = ones * float(patv[nb, origin].mean())
+        f["nbr_wspd_last"] = ones * float(wspd[nb, origin].mean())
+        f["nbr_wspd_mean_6h"] = ones * float(wspd[nb, lo6:origin + 1].mean())
+
+    if "turb_x" in names:
+        f["turb_x"] = ones * ctx["xy"][t, 0]
+        f["turb_y"] = ones * ctx["xy"][t, 1]
+
+    X = np.empty((n, len(names)), dtype=np.float32)
+    for j, name in enumerate(names):
+        X[:, j] = f[name]
     return X
 
 
-def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42):
+def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
+                       feature_set=None, k=None):
     """
     Description:
         Sample forecast origins from the training CSV and build the direct
         multi-horizon training matrix. Sampling keeps the problem tractable:
         every origin could contribute 288 rows, so horizons are subsampled.
     Args:
-        csv_path: path to sdwpf_245days_v1.csv
+        csv_path: path to the truncated training CSV
         n_origins: forecast origins sampled per turbine
         horizon_stride: keep every Nth horizon step (12 -> 24 of the 288)
         seed: RNG seed for origin sampling
+        feature_set: tier name
+        k: neighbours per turbine
     Returns:
         A tuple (X, y) of float arrays.
     """
     rng = np.random.default_rng(seed)
     df = pd.read_csv(csv_path)
-    total = len(df) // CAPACITY
-    patv_all = np.nan_to_num(df["Patv"].to_numpy(dtype=np.float32), nan=0.0)
-    wspd_all = np.nan_to_num(df["Wspd"].to_numpy(dtype=np.float32), nan=0.0)
+    ctx = build_context(df, CAPACITY, feature_set, k)
+    total = ctx["total"]
     horizons = np.arange(1, OUTPUT_LEN + 1, horizon_stride)
 
     Xs, ys = [], []
     lo, hi = DAY_LEN, total - OUTPUT_LEN - 1        # need history behind, truth ahead
     for t in range(CAPACITY):
-        p = patv_all[t * total:(t + 1) * total]
-        w = wspd_all[t * total:(t + 1) * total]
-        tmean = float(p.mean())
         origins = rng.integers(lo, hi, size=n_origins)
         for o in origins:
-            Xs.append(_build_features(p, w, int(o), horizons, tmean))
-            ys.append(p[o + horizons])
+            Xs.append(_build_features(ctx, t, int(o), horizons))
+            ys.append(ctx["patv"][t][o + horizons])
     return np.vstack(Xs), np.concatenate(ys)
 
 
 def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
-          model_path=None, n_estimators=400, max_depth=6, learning_rate=0.05):
+          model_path=None, n_estimators=400, max_depth=6, learning_rate=0.05,
+          feature_set=None, k=None, subsample=0.8, colsample_bytree=0.8,
+          min_child_weight=1, objective="reg:squarederror"):
     """
     Description:
-        Fit the global XGBoost model and write it to disk.
+        Fit the global XGBoost model and write it to disk, recording which
+        feature tier produced it so inference cannot silently mismatch.
     Args:
         csv_path: training CSV (defaults to TRAIN_CSV)
         n_origins: forecast origins sampled per turbine
@@ -180,14 +378,24 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
         n_estimators: number of boosting rounds (trees)
         max_depth: maximum depth of each tree
         learning_rate: shrinkage applied to each tree's contribution
+        feature_set: tier name
+        k: neighbours per turbine for the spatial tiers
+        subsample / colsample_bytree / min_child_weight: XGBoost regularisation
+        objective: XGBoost loss. "reg:squarederror" matches RMSE;
+                   "reg:absoluteerror" matches MAE. The competition score is
+                   half of each, so neither is the right loss and both are worth
+                   measuring.
     Returns:
         The fitted model.
     """
     csv_path = csv_path or TRAIN_CSV
     model_path = model_path or MODEL_PATH
+    fs = feature_set or FEATURE_SET
+    names = feature_names(fs)
     print("building training set from", csv_path)
+    print("  feature set: {} ({} features)".format(fs, len(names)))
     t0 = time.perf_counter()
-    X, y = build_training_set(csv_path, n_origins, horizon_stride, seed)
+    X, y = build_training_set(csv_path, n_origins, horizon_stride, seed, fs, k)
     print("  {:,} rows x {} features in {:.1f}s".format(X.shape[0], X.shape[1],
                                                         time.perf_counter() - t0))
 
@@ -195,9 +403,10 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
         n_estimators=n_estimators,      # number of trees, added one after another
         max_depth=max_depth,            # how many yes/no questions deep each tree goes
         learning_rate=learning_rate,    # shrink each tree's correction (smaller = safer)
-        subsample=0.8,                  # each tree sees 80% of rows (reduces overfitting)
-        colsample_bytree=0.8,           # each tree sees 80% of features
-        objective="reg:squarederror",   # minimize squared error (matches RMSE)
+        subsample=subsample,            # fraction of rows each tree sees
+        colsample_bytree=colsample_bytree,   # fraction of features each tree sees
+        min_child_weight=min_child_weight,   # minimum evidence to justify a split
+        objective=objective,            # the loss being minimised
         random_state=seed,
         n_jobs=-1,                      # use all CPU cores
     )
@@ -205,7 +414,8 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
     model.fit(X, y)
     print("  fitted {} trees in {:.1f}s".format(n_estimators, time.perf_counter() - t0))
 
-    joblib.dump({"model": model, "features": FEATURES}, model_path)
+    joblib.dump({"model": model, "features": names, "feature_set": fs,
+                 "k": K_NEIGHBOURS if k is None else k}, model_path)
     print("saved to", model_path)
     return model
 
@@ -213,7 +423,9 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
 def _load_model():
     """
     Description:
-        Load the fitted model once and cache it for the remaining windows.
+        Load the fitted model once and cache it, together with the feature tier
+        it was trained on -- so a checkpoint trained on one tier can never be
+        scored with another tier's features.
     Args:
         None
     Returns:
@@ -223,8 +435,12 @@ def _load_model():
         if not os.path.exists(MODEL_PATH):
             raise FileNotFoundError(
                 "No trained model at {!r}. Train it first: "
-                "python baseline_models/tree/baseline_gbdt.py".format(MODEL_PATH))
-        _CACHE["model"] = joblib.load(MODEL_PATH)["model"]
+                "python baselines/tree/baseline_gbdt.py".format(MODEL_PATH))
+        blob = joblib.load(MODEL_PATH)
+        _CACHE["model"] = blob["model"]
+        _CACHE["features"] = blob.get("features", FEATURES)
+        _CACHE["feature_set"] = blob.get("feature_set", "base")
+        _CACHE["k"] = blob.get("k", K_NEIGHBOURS)
     return _CACHE["model"]
 
 
@@ -232,10 +448,12 @@ def forecast(envs):
     """
     Description:
         Predict each turbine's next 48h with the shared XGBoost model, building
-        features from that turbine's history in the test window.
+        features from the test window's own history. The feature tier is taken
+        from the checkpoint, not from the module constant, so a mismatch is
+        impossible.
     Args:
-        envs: settings dict; must contain "path_to_test_x". Optional "capacity"
-              and "output_len" override the defaults.
+        envs: settings dict; must contain "path_to_test_x". Optional "capacity",
+              "output_len" and "path_to_locations" override the defaults.
     Returns:
         A float array of shape (capacity, output_len, 1) with predicted Patv (kW).
     """
@@ -244,22 +462,17 @@ def forecast(envs):
     model = _load_model()
 
     df = pd.read_csv(envs["path_to_test_x"])
-    total = len(df) // capacity
-    patv_all = np.nan_to_num(df["Patv"].to_numpy(dtype=np.float32), nan=0.0)
-    wspd_all = np.nan_to_num(df["Wspd"].to_numpy(dtype=np.float32), nan=0.0)
+    ctx = build_context(df, capacity, _CACHE["feature_set"], _CACHE["k"],
+                        envs.get("path_to_locations"))
     horizons = np.arange(1, output_len + 1)
+    origin = ctx["total"] - 1
 
     # Build features for every turbine, predict in one batched call for speed.
-    blocks = []
-    for t in range(capacity):
-        p = patv_all[t * total:(t + 1) * total]
-        w = wspd_all[t * total:(t + 1) * total]
-        blocks.append(_build_features(p, w, len(p) - 1, horizons, float(p.mean())))
+    blocks = [_build_features(ctx, t, origin, horizons) for t in range(capacity)]
     X = np.vstack(blocks)                              # (capacity*output_len, n_features)
     yhat = model.predict(X).reshape(capacity, output_len)
 
-    preds = np.clip(yhat, 0.0, None)[:, :, None].astype(float)
-    return preds
+    return np.clip(yhat, 0.0, None)[:, :, None].astype(float)
 
 
 def main():
@@ -272,17 +485,24 @@ def main():
         None
     """
     ap = argparse.ArgumentParser(description="Train the global XGBoost SDWPF baseline")
-    ap.add_argument("--data", type=str, default=TRAIN_CSV, help="Path to the 245-day CSV")
+    ap.add_argument("--data", type=str, default=TRAIN_CSV, help="Path to the training CSV")
     ap.add_argument("--model", type=str, default=MODEL_PATH, help="Output model path")
+    ap.add_argument("--features", type=str, default=FEATURE_SET, choices=TIERS,
+                    help="Feature tier (default: {})".format(FEATURE_SET))
+    ap.add_argument("--k", type=int, default=K_NEIGHBOURS,
+                    help="Nearest turbines aggregated by the spatial tiers")
     ap.add_argument("--origins", type=int, default=150, help="Origins sampled per turbine")
     ap.add_argument("--stride", type=int, default=12, help="Horizon subsampling stride")
     ap.add_argument("--trees", type=int, default=400, help="Number of boosting rounds")
     ap.add_argument("--depth", type=int, default=6, help="Max tree depth")
     ap.add_argument("--lr", type=float, default=0.05, help="Learning rate (shrinkage)")
+    ap.add_argument("--objective", type=str, default="reg:squarederror",
+                    help="XGBoost loss (reg:squarederror | reg:absoluteerror)")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed")
     a = ap.parse_args()
     train(a.data, a.origins, a.stride, a.seed, a.model,
-          n_estimators=a.trees, max_depth=a.depth, learning_rate=a.lr)
+          n_estimators=a.trees, max_depth=a.depth, learning_rate=a.lr,
+          feature_set=a.features, k=a.k, objective=a.objective)
 
 
 if __name__ == "__main__":

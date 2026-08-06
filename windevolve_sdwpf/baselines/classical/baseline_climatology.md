@@ -46,3 +46,30 @@ Predictions are clipped at zero.
 python evaluator.py baseline_climatology.py
 ```
 
+
+---
+
+## Parameters added for the sweep
+
+Four module-level constants were added so `analysis/sweep.py` can vary the model
+without editing it. **All four default to the original behaviour**, verified by
+comparing forecasts on a validation window: max absolute difference 0.0.
+
+| Constant | Default | What it does |
+|---|---|---|
+| `N_DAYS` | `None` (all 14) | Average only the most recent *N* days of the window's history. The interpretable answer to "14 days or 5 days". |
+| `AGG` | `"mean"` | `"mean"` or `"median"` across days. SDWPF power is heavily zero-inflated — curtailment, icing, maintenance — so a couple of parked days drag a mean profile down and leave a median untouched. |
+| `HALFLIFE_DAYS` | `None` (uniform) | Exponentially weight the days instead of cutting them off: the most recent day gets weight 1, a day `HALFLIFE_DAYS` earlier gets 0.5. Only applies when `AGG` is `"mean"`. NaN-aware, so a gap does not bias its day toward zero. |
+| `SMOOTH_STEPS` | `0` (off) | Width, in 10-minute steps, of a **circular** moving average over the finished 144-step profile. Circular because time of day wraps: 23:50 is adjacent to 00:00. |
+
+**Why both `N_DAYS` and `HALFLIFE_DAYS`.** They answer the same question with
+different sharpness. A hard cutoff trusts day 5 completely and discards day 6
+entirely, which is not a belief anyone actually holds; the half-life says recent
+days matter more and older ones fade. `N_DAYS` is the readable summary,
+`HALFLIFE_DAYS` is the better-posed version. If they disagree about how much
+recent history matters, trust the half-life curve.
+
+**Why `SMOOTH_STEPS` is swept crossed with `N_DAYS`, not alone.** Averaging few
+days leaves a visibly noisy profile, which the model then forecasts as though it
+were structure. Smoothing trades that noise for a little blur. The two knobs only
+make sense together, so the grid pairs them rather than varying each separately.

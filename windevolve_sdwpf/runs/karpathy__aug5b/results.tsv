@@ -1,0 +1,5 @@
+commit	competition_score	eval_seconds	status	description
+282b8ad	68.713548	5.9	keep	baseline persistence (last 288 Patv repeated)
+e88e17c	44.814951	5.8	keep	exp decay from 2h anchor to 14d per-turbine climatology, tau=6h
+2595958	44.195840	5.8	keep	1-step anchor + 0.85 global shrink
+fc18c1f	43.767716	6.2	keep	clim = 0.5*14d local + 0.5*long-run per-turbine level from val_train

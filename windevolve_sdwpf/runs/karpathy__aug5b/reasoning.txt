@@ -1,0 +1,56 @@
+I'll start by reading the program file.
+----------------------------------------------------------------------
+Setup is complete. Summary:
+
+**Run tag**: `aug5b` — branch `autoresearch/aug5b` created from master (`282b8ad`, "seed: persistence forecaster"). No prior branch with that name existed.
+
+**In-scope files read**:
+- `forecaster.py` — 66 lines. Baseline is pure persistence: read the infile, split `Patv` into 134 turbine-major blocks, repeat each turbine's last 288 values as the 48h forecast. NaNs → 0.
+- `../../../evaluation/evaluator.py` — scores through the verbatim official KDD Cup grader, one window at a time, averaging MAE/RMSE across windows. `competition_score = ½(RMSE+MAE)`. Key facts: `envs` also carries `path_to_train` (points at `VAL_TRAIN_FILE`, the truncated CSV — so training data is handed to me directly, no need to construct the path), `path_to_locations`, `capacity=134`, `output_len=288`. Degeneracy guards: `min_non_zero_ratio=0.9`, `min_distinct_ratio=0.1`. Hard in-evaluator budget of 600s wall-clock across all windows — exceeding it returns `valid: False`, so per-window forecast cost matters, and any model fitting should be cached module-level after the first call.
+
+**Split verified**: `python ../../../paths.py` reports `[ok]` for every entry, including `VAL_DIR` and `VAL_TRAIN_FILE`. 24 validation windows present.
+
+**`results.tsv`** created with just the header row. It's already in `.gitignore` (along with `run.log`), so it stays untracked as the program requires.
+
+**Environment**: numpy 2.5.1, pandas 3.0.5, scipy, scikit-learn 1.9.0, statsmodels, xgboost 3.3.0, torch 2.13.0 all available — no installs needed.
+
+Nothing under `final_phase_test/` or `val_windows/outfile/` has been touched, and won't be.
+
+First run will be the unmodified baseline, as required. Ready to kick off the loop on your confirmation.
+----------------------------------------------------------------------
+Kicking off. First run: baseline, unmodified.
+----------------------------------------------------------------------
+Baseline established: **68.714 MW**, 5.9s.
+----------------------------------------------------------------------
+Baseline logged. Now the first real experiment: persistence is a poor 48h forecast — skill decays within hours. Replacing it with an exponential blend from a recent anchor toward each turbine's climatological level.
+----------------------------------------------------------------------
+Big win: **68.714 → 44.815**. Keeping. Let me log it and build an internal validation harness from `val_train.csv` so I can tune hyperparameters without overfitting the 24 real val windows.
+----------------------------------------------------------------------
+Harness tracks the real evaluator well (46.45 internal vs 44.82 real for the same predictor — offset from approximate masking, but rankings should transfer). Now sweeping the level estimate, which is what dominates at long lead times.
+----------------------------------------------------------------------
+Level tuning helps. Extending the sweep and testing multi-timescale anchors before committing.
+----------------------------------------------------------------------
+Quantile is a brittle knob (sharp cliff past 0.65) for little gain over a plain shrink factor — the simpler `mean × 0.85` gets nearly the same. Checking anchor robustness, then committing.
+----------------------------------------------------------------------
+**44.196** (from 44.815). Keeping. Now the bigger step: replacing the hand-tuned decay with a per-lead-time linear model fit on the training split.
+----------------------------------------------------------------------
+Ridge (LS) underperforms the hand-tuned decay — unsurprising, since the metric is closer to MAE than to squared error. But the row structure here is convenient: each training row *is* one turbine-window, so I can optimize the competition objective exactly rather than a proxy.
+----------------------------------------------------------------------
+LS ties the hand-tuned decay (38.76 vs 38.78) — the extra timescales add nothing. The direct metric fit was just converging too slowly from zero. Seeding it from LS to find the actual ceiling for this feature set.
+----------------------------------------------------------------------
+The learned linear model isn't beating the two-parameter decay — the extra features carry no signal and the fit doesn't transfer across seasons. Dropping that direction and recording why.
+----------------------------------------------------------------------
+Lead-dependent shrink overfits the training season (helps train, hurts test) — discarded. But blending in the long-run per-turbine level helps on both. That suggests turbines have persistent individual strength that a 14-day window estimates noisily, so let me test a cleaner decomposition: current farm-wide regime × turbine's long-run relative strength.
+----------------------------------------------------------------------
+The ratio decomposition does nothing — my hypothesis was wrong. And I suspect the raw-blend gain is really just extra shrinkage in disguise. Let me disentangle that properly across several disjoint periods, and check where the error actually lives by lead time.
+----------------------------------------------------------------------
+Now it's clear: `w=0.5` beats `w=0.0` at *every* shrink level and in *every one* of the four blocks — real information, not disguised shrinkage. Implementing it, which means reading the training file once. Timing that first.
+----------------------------------------------------------------------
+**43.768** (from 44.196). Keeping. Next: the 14-day diurnal profile hurt earlier because it was noisy — but with ~150 days of training data a time-of-day profile is far better estimated. Testing that, plus re-tuning the knobs now that the climatology changed.
+----------------------------------------------------------------------
+The long-weight sweep was contaminated — my `LONG` spans days 1–150 but two blocks sit inside it. Rebuilding with strictly prior-only history per block so the sweep is honest.
+----------------------------------------------------------------------
+Even leakage-free, higher long-weight and longer tau keep helping — but the block closest to the real setting (latest, most prior history) disagrees. Let me look at per-block behavior for tau before deciding.
+----------------------------------------------------------------------
+I'll start by reading the program spec.
+----------------------------------------------------------------------

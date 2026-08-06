@@ -111,12 +111,44 @@ def default_settings():
         # trains on another turbine's data. main() therefore overrides all three
         # from the file's actual length -- see resolve_day_sizes().
         "lstm_layer": 2,          # GRU layers
+        "hidden": 48,             # GRU hidden size (official: 48)
         "dropout": 0.05,          # dropout before the projection
         "capacity": 134,          # turbines
         "train_epochs": 10,       # max epochs per turbine
         "batch_size": 32,         # minibatch size
         "patience": 3,            # early-stopping patience
         "lr": 1e-4,               # Adam learning rate
+        "lr_decay": 0.5,          # per-epoch multiplier (official "type1")
+        "clip_norm": 50.0,        # gradient norm bound
+
+        # ------------------------------------------------------------------
+        # DEVIATION SWITCHES. Every default below reproduces the official
+        # baseline's behaviour, INCLUDING its defects -- see gru_baseline.md
+        # section 6. They are settings rather than hardcoded so the cost of
+        # each defect can be measured instead of argued about. Flipping all
+        # four gives an ordinary, correct PyTorch training loop.
+        #
+        #   zero_grad   False = official. The official train.py never calls
+        #               clear_grad(), so the gradient buffer accumulates across
+        #               every batch AND every epoch. True restores the normal
+        #               optimizer.zero_grad() per step.
+        #   double_step True  = official. paddle's minimize(loss) already
+        #               updates, and the loop then calls step() as well, giving
+        #               two Adam applications per batch. False applies one.
+        #   global_clip False = official (paddle ClipGradByNorm bounds each
+        #               parameter tensor separately). True uses PyTorch's usual
+        #               global-norm rule.
+        #   eval_val    False = official (validation runs with dropout live, so
+        #               the early-stopping signal is noisy). True calls eval().
+        #   shuffle_val True  = official (the val loader shuffles with
+        #               drop_last, discarding a different random subset every
+        #               epoch). False measures the same windows each time.
+        # ------------------------------------------------------------------
+        "zero_grad": False,
+        "double_step": True,
+        "global_clip": False,
+        "eval_val": False,
+        "shuffle_val": True,
     }
 
 
@@ -305,7 +337,7 @@ class BaselineGruModel(nn.Module):
         super(BaselineGruModel, self).__init__()
         self.output_len = settings["output_len"]      # forecast horizon (288)
         self.hidC = settings["in_var"]                # input feature count (10)
-        self.hidR = 48                                # GRU hidden size (fixed at 48)
+        self.hidR = settings.get("hidden", 48)        # GRU hidden size (official 48)
         self.out = settings["out_var"]                # output variables (1 = Patv)
         self.dropout = nn.Dropout(settings["dropout"])
         self.lstm = nn.GRU(input_size=self.hidC, hidden_size=self.hidR,
@@ -458,24 +490,28 @@ def parse_turbines(spec, capacity):
     return sorted(i for i in ids if 0 <= i < capacity)
 
 
-def adjust_learning_rate(optimizer, epoch, lr):
+def adjust_learning_rate(optimizer, epoch, lr, decay=0.5):
     """
     Description:
-        Apply the baseline's "type1" schedule: halve the learning rate each
-        epoch (lr * 0.5**(epoch-1)).
+        Apply the baseline's "type1" schedule: multiply the learning rate by
+        `decay` each epoch (lr * decay**(epoch-1)). decay=0.5 is official and
+        means the rate is ~1/500th of its original value by epoch 10 -- which,
+        starting from 1e-4, is why the model barely moves in the later epochs.
+        decay=1.0 disables the schedule.
     Args:
         optimizer: the Adam optimizer being updated
         epoch: 1-based epoch number just completed
         lr: the base learning rate
+        decay: per-epoch multiplier
     Returns:
         None
     """
-    new_lr = lr * (0.5 ** (epoch - 1))
+    new_lr = lr * (decay ** (epoch - 1))
     for group in optimizer.param_groups:
         group["lr"] = new_lr
 
 
-def clip_gradients(model, max_norm=50.0):
+def clip_gradients(model, max_norm=50.0, global_norm=False):
     """
     Description:
         Clip gradients the way the official baseline does: PER PARAMETER.
@@ -489,22 +525,28 @@ def clip_gradients(model, max_norm=50.0):
     Args:
         model: the model whose gradients are being clipped
         max_norm: the per-parameter norm bound (50.0, from the official settings)
+        global_norm: True to use PyTorch's usual global rule instead
     Returns:
         None
     """
+    if global_norm:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
+        return
     for p in model.parameters():
         if p.grad is not None:
             torch.nn.utils.clip_grad_norm_([p], max_norm=max_norm)
 
 
-def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
+def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True,
+              settings=None):
     """
     Description:
         Run one pass over a data loader, optionally updating the model,
-        reproducing the official training loop exactly. Three deviations from a
-        standard PyTorch loop are deliberate and are marked inline: gradients
-        are never zeroed, the optimizer is applied twice per batch, and
-        validation runs with dropout active.
+        reproducing the official training loop exactly under the default
+        settings. Three deviations from a standard PyTorch loop are deliberate
+        and are marked inline: gradients are never zeroed, the optimizer is
+        applied twice per batch, and validation runs with dropout active. Each
+        is switchable via the settings dict so its cost can be measured.
     Args:
         model: the GRU being trained or evaluated
         loader: DataLoader yielding (seq_x, seq_y) batches
@@ -513,13 +555,24 @@ def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
         device: torch device to run on
         out_var: number of output variables (1); selects the target column
         train: True to backpropagate, False for validation
+        settings: hyperparameter dict; the deviation switches are read from it
     Returns:
         The mean loss over the epoch as a float.
     """
+    s = settings or {}
+    zero_grad = s.get("zero_grad", False)
+    double_step = s.get("double_step", True)
+    global_clip = s.get("global_clip", False)
+    clip_norm = s.get("clip_norm", 50.0)
+
     # Deviation 2: the official train.py sets model.train() at the top of each
     # epoch and its val() never switches to eval, so the validation loss driving
-    # early stopping is computed WITH dropout active. Hence train() either way.
-    model.train()
+    # early stopping is computed WITH dropout active. Hence train() either way,
+    # unless eval_val asks otherwise.
+    if train or not s.get("eval_val", False):
+        model.train()
+    else:
+        model.eval()
 
     losses = []
     with torch.set_grad_enabled(train):
@@ -531,20 +584,23 @@ def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True):
             target = batch_y[:, -sample.shape[1]:, -out_var:]
             loss = criterion(sample, target)
             if train:
-                # Deviation 3: NO optimizer.zero_grad(). The official train.py
-                # never calls clear_grad() anywhere in the run, so the gradient
-                # buffer accumulates monotonically across every batch and every
-                # epoch. Verified with lr forced to 0: norms grew 1.00x, 2.00x,
-                # 3.00x, 4.00x over successive batches.
+                # Deviation 3: NO optimizer.zero_grad() by default. The official
+                # train.py never calls clear_grad() anywhere in the run, so the
+                # gradient buffer accumulates monotonically across every batch
+                # and every epoch. Verified with lr forced to 0: norms grew
+                # 1.00x, 2.00x, 3.00x, 4.00x over successive batches.
+                if zero_grad:
+                    optimizer.zero_grad()
                 loss.backward()
-                clip_gradients(model)
+                clip_gradients(model, clip_norm, global_clip)
                 optimizer.step()
                 # Deviation 4: paddle's `minimize(loss)` already applies the
                 # update and the official loop then calls `step()` too, giving
                 # two Adam applications per batch. Verified: 2.00x the weight
                 # movement of a single step.
-                clip_gradients(model)
-                optimizer.step()
+                if double_step:
+                    clip_gradients(model, clip_norm, global_clip)
+                    optimizer.step()
             losses.append(loss.item())
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -574,7 +630,8 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir):
     # and val, with drop_last=True -- so a different random subset of validation
     # windows is discarded every epoch, adding noise to the early-stopping signal.
     val_loader = DataLoader(val_ds, batch_size=settings["batch_size"],
-                            shuffle=True, drop_last=True)
+                            shuffle=settings.get("shuffle_val", True),
+                            drop_last=settings.get("shuffle_val", True))
 
     model = BaselineGruModel(settings).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=settings["lr"])
@@ -586,9 +643,9 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir):
 
     for epoch in range(1, settings["train_epochs"] + 1):
         tr_loss = run_epoch(model, train_loader, criterion, optimizer, device,
-                            settings["out_var"], train=True)
+                            settings["out_var"], train=True, settings=settings)
         va_loss = run_epoch(model, val_loader, criterion, optimizer, device,
-                            settings["out_var"], train=False)
+                            settings["out_var"], train=False, settings=settings)
         print("    turbine {:3d} epoch {:2d}  train {:.6f}  val {:.6f}".format(
             tid, epoch, tr_loss, va_loss))
         if va_loss < best_val:
@@ -600,7 +657,8 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir):
             if bad_epochs >= settings["patience"]:
                 print("    turbine {:3d} early stopped at epoch {}".format(tid, epoch))
                 break
-        adjust_learning_rate(optimizer, epoch + 1, settings["lr"])
+        adjust_learning_rate(optimizer, epoch + 1, settings["lr"],
+                             settings.get("lr_decay", 0.5))
 
     # Persist weights AND scaler stats so inference needs no training CSV.
     # `full_run` records whether this checkpoint came from a single pass over
@@ -779,6 +837,25 @@ def main():
                         help="Inner-validation days used ONLY for early stopping. Must sum "
                              "with --train-days to the file's day count. Default: the "
                              "remainder (245-day file -> 31; 196-day file -> 25)")
+    parser.add_argument("--input-len", type=int, default=None,
+                        help="History steps fed to the GRU (official: 144 = 24h, to "
+                             "predict 288 = 48h). Larger gives the model more context")
+    parser.add_argument("--hidden", type=int, default=None,
+                        help="GRU hidden size (official: 48)")
+    parser.add_argument("--layers", type=int, default=None,
+                        help="Stacked GRU layers (official: 2)")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="Dropout before the projection (official: 0.05)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Adam learning rate (official: 1e-4)")
+    parser.add_argument("--lr-decay", type=float, default=None,
+                        help="Per-epoch LR multiplier (official: 0.5; 1.0 disables)")
+    parser.add_argument("--fixed-loop", action="store_true",
+                        help="Replace the official loop's four defects with correct "
+                             "behaviour: zero gradients each step, one optimizer step "
+                             "per batch, global-norm clipping, and dropout off during "
+                             "validation. This NO LONGER reproduces the published "
+                             "baseline -- report it as a separate model")
     parser.add_argument("--device", type=str, default=None, help="cuda | mps | cpu (default: auto)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Retrain turbines whose checkpoints already exist")
@@ -789,6 +866,16 @@ def main():
         settings["train_epochs"] = args.epochs
     if args.batch_size is not None:
         settings["batch_size"] = args.batch_size
+    for key, val in (("input_len", args.input_len), ("hidden", args.hidden),
+                     ("lstm_layer", args.layers), ("dropout", args.dropout),
+                     ("lr", args.lr), ("lr_decay", args.lr_decay)):
+        if val is not None:
+            settings[key] = val
+    if args.fixed_loop:
+        settings.update({"zero_grad": True, "double_step": False,
+                         "global_clip": True, "eval_val": True,
+                         "shuffle_val": False})
+        print("*** --fixed-loop: this is NOT the published baseline ***")
 
     device = pick_device(args.device)
     turbines = parse_turbines(args.turbines, settings["capacity"])

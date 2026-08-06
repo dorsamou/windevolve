@@ -149,3 +149,68 @@ python baseline_models/tree/baseline_gbdt.py --origins 50 --trees 100
 2. **Manual feature engineering.** The choice of lags and windows is a human modeling decision — precisely the gap an evolutionary search is meant to close automatically. (A pointed irony worth noting in the writeup.)
 3. **No spatial information.** Turbine coordinates are available in `envs["path_to_locations"]` but unused.
 4. **Sampling variance.** Origins are randomly sampled, so results shift slightly with `--seed`. Average over seeds before claiming a difference from another method.
+
+---
+
+## Parameters added for the sweep
+
+### Feature tiers
+
+The feature list is no longer fixed. `FEATURE_SET` (or `--features`) selects one
+of six **nested** tiers, each a strict superset of the one before, so each
+adjacent pair isolates exactly one block of information.
+
+| Tier | Adds | n | The question it answers |
+|---|---|---|---|
+| `power` | — (`base` minus the wind-speed columns) | 9 | |
+| `base` | `wspd_last`, `wspd_mean_6h`, `wspd_mean_24h` | 12 | **what is wind speed worth?** |
+| `turbine` | `wdir_sin`, `wdir_cos`, `etmp_last`, `itmp_last`, `pab_max_last`, `prtv_last`, `zero_frac_24h`, `wspd_std_24h`, `patv_mean_48h`, `wspd_yesterday` | 22 | what are the turbine's other channels worth? |
+| `farm` | `farm_patv_now`, `farm_wspd_now`, `farm_patv_24h`, `turbine_share` | 26 | what is farm-wide state worth? |
+| `neighbour` | `nbr_patv_last`, `nbr_wspd_last`, `nbr_wspd_mean_6h`, over the *k* nearest turbines | 29 | **what is the farm layout worth?** |
+| `xy` | `turb_x`, `turb_y` | 31 | what is turbine *identity* worth? |
+
+`base` reproduces the original 12 features **in the original column order**,
+verified bit-for-bit against the previous implementation across several
+(turbine, origin) pairs. The order matters as well as the set: reordering would
+change which columns `colsample_bytree` draws and move the score for no reason.
+
+### Notes on three of the tiers
+
+**`turbine` gives the model a way to tell *why* a turbine is at zero.** The
+original feature set reads power and wind speed and nothing else. `pab_max_last`
+— the largest of the three pitch angles — says the blades are feathered, i.e.
+the turbine is deliberately spilling wind and will probably still be doing so in
+an hour. `zero_frac_24h` says how much of the last day it spent at zero. Given
+how much of SDWPF is zero-inflated, this is the tier with the most obvious room
+to help. `Wdir` enters as sin/cos rather than degrees because direction is
+circular: 359° and 1° are one degree apart but 358 apart as raw numbers, and a
+tree would otherwise spend splits rediscovering that.
+
+**`farm` and `neighbour` are spatial but carry no identity.** Both are aggregates
+over *other* turbines — the farm mean at the origin, and the mean power and wind
+speed of the *k* nearest turbines from
+`sdwpf_baidukddcup2022_turb_location.csv`. The physical story is that upwind
+turbines see weather before downwind ones do, which is what the competition's
+spatial entrants were after. `k` defaults to 5 and is itself sweepable.
+
+**`xy` is a turbine identifier in disguise, and is reported separately.** Each
+turbine has unique coordinates, so a tree given x/y can memorise per-turbine
+behaviour. That quietly converts the *global* model into 134 private models and
+destroys the one property that makes this baseline the right comparator for the
+generalisation question. It is included because the `neighbour` → `xy` gap is a
+direct estimate of how much of the achievable score is turbine-specific rather
+than transferable — the project's central question in miniature. It is **not**
+part of "the tuned XGBoost".
+
+### Other parameters
+
+| Parameter | Default | Notes |
+|---|---|---|
+| `k` / `--k` | 5 | Nearest turbines aggregated by the `neighbour` tier. |
+| `objective` / `--objective` | `reg:squarederror` | The score is `0.5*(RMSE+MAE)`, so squared error over-weights the tail relative to what is scored and `reg:absoluteerror` under-weights it. Neither is the right loss, which is what makes measuring both informative. |
+| `subsample`, `colsample_bytree`, `min_child_weight` | 0.8, 0.8, 1 | Previously hardcoded; now arguments to `train()`. Defaults unchanged. |
+
+The saved `.joblib` now records `feature_set` and `k` alongside the model, and
+`forecast()` reads the tier **from the checkpoint** rather than from the module
+constant — so a model trained on one tier can never be scored with another
+tier's features.

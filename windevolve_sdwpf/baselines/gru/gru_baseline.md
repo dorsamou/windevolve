@@ -284,3 +284,61 @@ Two numbers circulate for "the official GRU baseline". They are not two estimate
 42.32 is the baseline authors' own development number. It is lower not because the model is better there, but because the validation tail is easier *and* the development scorer is more lenient — it has no NaN condition in its mask and reads about 4.5% lower on identical inputs.
 
 One caution when reading results: a score from `evaluator.py` is a **validation** number and is not comparable with 47.850, which is a **test** number. Only `competition_score.py` on `final_phase_test` produces a like-for-like comparison.
+
+---
+
+## 8. Parameters added for the sweep, and the two GRUs
+
+Section 6 lists eight deviations from a normal PyTorch loop, all reproduced
+because the official code does them. Four of those are now **switchable**, so
+their cost can be measured rather than argued about. Every switch defaults to
+the official behaviour, so nothing above changes unless a switch is flipped.
+
+| Setting | Official (default) | Corrected | What the official actually does |
+|---|---|---|---|
+| `zero_grad` | `False` | `True` | Never calls `clear_grad()`, so the gradient buffer accumulates across every batch **and every epoch** — by batch *n* the applied gradient is the sum of all *n* preceding ones |
+| `double_step` | `True` | `False` | Paddle's `minimize()` already updates and the loop calls `step()` too: two Adam applications per batch |
+| `global_clip` | `False` | `True` | Clips each parameter tensor separately (`ClipGradByNorm`) rather than the global norm |
+| `eval_val` | `False` | `True` | Validation runs with dropout live, so the early-stopping signal is noisy |
+| `shuffle_val` | `True` | `False` | Shuffles the validation loader with `drop_last`, discarding a different random subset every epoch |
+
+`--fixed-loop` flips all five together. Architecture and optimisation knobs were
+also exposed: `hidden` (48), `lstm_layer` (2), `input_len` (144), `dropout`
+(0.05), `lr` (1e-4), `lr_decay` (0.5), all defaulting to the official values,
+plus `--input-len`, `--hidden`, `--layers`, `--dropout`, `--lr`, `--lr-decay`.
+
+### Which GRU is the baseline
+
+**The corrected loop.** The purpose of the baseline suite in this project is to
+provide a comparator for the evolutionary search and a plausible seed program,
+not to reproduce a published number — and a knowingly-broken training loop is
+the wrong default for either job.
+
+The official loop stays in the sweep as one point. It costs nothing (the
+existing checkpoints are reused) and it documents the provenance: it is the row
+that connects this project to the published **47.850**. Anything trained with
+`--fixed-loop` must **not** be labelled "the official baseline"; report it as a
+corrected reimplementation and keep the official row beside it.
+
+### On the earlier, better-scoring version
+
+An earlier implementation of this file was an ordinary PyTorch loop and scored
+better. That is the expected direction — deviations 3 and 4 alone are enough to
+explain it. But the two numbers should **not** be differenced, because more than
+the loop changed between them: the scorer moved from the development
+`metrics.py` to the real submission grader (about 4.5% apart on identical
+inputs, larger than the whole spread of the baseline table), and the evaluation
+data may have moved between the validation tail and `final_phase_test`, which
+Section 7 warns are not comparable. The `train_loop` axis of
+`analysis/sweep.py` resolves it properly: both loops, one split, one grader.
+
+### Notes on the exposed knobs
+
+- **`input_len` is the most suspicious default.** The model reads 144 steps
+  (24 h) and predicts 288 (48 h) — it forecasts two days from one.
+- **`hidden = 48` gives 22,801 parameters per turbine**, tiny by modern
+  standards, and nothing is shared between the 134 models.
+- **The LR schedule may stop training early.** `lr` starts at 1e-4 and halves
+  every epoch, so by epoch 10 it is roughly 1/500th of its starting value.
+- Architecture and optimiser points in the sweep run on the **corrected** loop,
+  so a capacity result is not confounded with a broken optimizer.
