@@ -19,3 +19,9 @@ COMPLETED
 # karpathy workspace is its own git repo, pushed separately
 windevolve_sdwpf/arms/karpathy/workspace/
 artifacts
+leaderboard/*/fit*/
+leaderboard/*/ckpt*/
+*.png
+*.tsv
+*.npy
+npy

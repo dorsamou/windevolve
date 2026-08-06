@@ -1,0 +1,7 @@
+{
+  "label": "lag=144",
+  "scale": 1.0,
+  "overrides": {
+    "LAG": "144"
+  }
+}

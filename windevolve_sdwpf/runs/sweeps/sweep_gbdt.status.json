@@ -1,11 +1,11 @@
 {
   "model": "gbdt",
-  "done": 11,
+  "done": 29,
   "total": 29,
-  "last_label": "trees=400",
+  "last_label": "default scale=0.2",
   "last_valid": true,
-  "last_score": 46.13895534335785,
-  "elapsed_seconds": 116.2,
-  "eta_seconds": 190.1,
-  "updated": "2026-08-06T12:02:48"
+  "last_score": 55.24353252080205,
+  "elapsed_seconds": 283.1,
+  "eta_seconds": 0.0,
+  "updated": "2026-08-06T12:05:35"
 }
