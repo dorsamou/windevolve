@@ -1,0 +1,24 @@
+ts	model	axis	label	config	score	rmse	mae	latest_rmse	n_windows	eval_seconds	fit_seconds	valid	reason
+2026-08-06T10:37:03	arma	order	order=1,0,1	{"fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	20.56	383.3	1	
+2026-08-06T10:41:35	arma	order	order=1,0,0	{"fit": {"order": [1, 0, 0]}, "scale": 1.0}	45.0627	48.9446	41.1808	50.357	24	18.62	253.9	1	
+2026-08-06T10:53:54	arma	order	order=2,0,1	{"fit": {"order": [2, 0, 1]}, "scale": 1.0}	45.5368	49.4985	41.5751	51.1907	24	19.38	719.5	1	
+2026-08-06T11:06:41	arma	order	order=2,0,2	{"fit": {"order": [2, 0, 2]}, "scale": 1.0}	44.8831	48.7512	41.015	50.4229	24	20.84	745.8	1	
+2026-08-06T11:08:59	arma	order	order=1,1,0	{"fit": {"order": [1, 1, 0]}, "scale": 1.0}							135.6	0	MetricsError: 92.54% turbines with (almost) identical predicted values (1th prediction)!
+2026-08-06T11:13:12	arma	order	order=1,1,1	{"fit": {"order": [1, 1, 1]}, "scale": 1.0}	56.631	61.433	51.829	65.1237	24	18.52	234.0	1	
+2026-08-06T11:15:41	arma	fit_days	order=1,0,1 fit_days=30	{"fit": {"fit_days": 30, "order": [1, 0, 1]}, "scale": 1.0}	44.3239	48.7046	39.9432	50.401	24	18.58	131.0	1	
+2026-08-06T11:19:14	arma	fit_days	order=1,0,1 fit_days=90	{"fit": {"fit_days": 90, "order": [1, 0, 1]}, "scale": 1.0}	44.6805	48.6697	40.6913	50.236	24	18.87	193.7	1	
+2026-08-06T11:19:38	arma	fit_days	order=1,0,1 fit_days=197	{"fit": {"fit_days": 197, "order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	24.33	0.0	1	
+2026-08-06T11:19:57	arma	apply_steps	order=1,0,1 apply=144	{"APPLY_STEPS": 144, "fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	18.3	0.0	1	
+2026-08-06T11:20:15	arma	apply_steps	order=1,0,1 apply=288	{"APPLY_STEPS": 288, "fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	18.86	0.0	1	
+2026-08-06T11:20:35	arma	apply_steps	order=1,0,1 apply=432	{"APPLY_STEPS": 432, "fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	19.4	0.0	1	
+2026-08-06T11:20:56	arma	apply_steps	order=1,0,1 apply=1008	{"APPLY_STEPS": 1008, "fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	21.48	0.0	1	
+2026-08-06T11:21:22	arma	apply_steps	order=1,0,1 apply=2016	{"APPLY_STEPS": 2016, "fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	25.11	0.0	1	
+2026-08-06T11:21:41	arma	scale	order=1,0,1 scale=1.0	{"fit": {"order": [1, 0, 1]}, "scale": 1.0}	44.9758	48.8529	41.0986	50.3475	24	19.38	0.0	1	
+2026-08-06T11:22:00	arma	scale	order=1,0,1 scale=0.9	{"fit": {"order": [1, 0, 1]}, "scale": 0.9}	44.5607	48.7118	40.4096	50.1774	24	19.46	0.0	1	
+2026-08-06T11:22:20	arma	scale	order=1,0,1 scale=0.8	{"fit": {"order": [1, 0, 1]}, "scale": 0.8}	44.5166	48.98	40.0531	50.3405	24	19.45	0.0	1	
+2026-08-06T11:22:39	arma	scale	order=1,0,1 scale=0.7	{"fit": {"order": [1, 0, 1]}, "scale": 0.7}	44.8802	49.6942	40.0663	50.866	24	19.37	0.0	1	
+2026-08-06T11:22:59	arma	scale	order=1,0,1 scale=0.6	{"fit": {"order": [1, 0, 1]}, "scale": 0.6}	45.7125	50.8888	40.5363	51.7944	24	19.45	0.0	1	
+2026-08-06T11:23:18	arma	scale	order=1,0,1 scale=0.5	{"fit": {"order": [1, 0, 1]}, "scale": 0.5}	47.0767	52.5981	41.5553	53.187	24	19.44	0.0	1	
+2026-08-06T11:23:38	arma	scale	order=1,0,1 scale=0.4	{"fit": {"order": [1, 0, 1]}, "scale": 0.4}	49.0283	54.8605	43.1961	55.1289	24	19.46	0.0	1	
+2026-08-06T11:23:57	arma	scale	order=1,0,1 scale=0.3	{"fit": {"order": [1, 0, 1]}, "scale": 0.3}	51.6117	57.6981	45.5253	57.6893	24	19.38	0.0	1	
+2026-08-06T11:24:17	arma	scale	order=1,0,1 scale=0.2	{"fit": {"order": [1, 0, 1]}, "scale": 0.2}	54.8135	61.0484	48.5787	60.8192	24	19.37	0.0	1	

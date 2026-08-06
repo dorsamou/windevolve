@@ -43,7 +43,7 @@ Predictions are clipped at zero.
 ## Usage
 
 ```bash
-python evaluator.py baseline_climatology.py
+python evaluation/evaluator.py baselines/classical/baseline_climatology.py
 ```
 
 

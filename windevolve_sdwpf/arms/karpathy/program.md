@@ -95,6 +95,7 @@ baseline, so run the scorer on `forecaster.py` unmodified.
 
 ```
 python ../../../evaluation/evaluator.py forecaster.py > run.log 2>&1
+cp run.log logs/$(git rev-parse --short HEAD).log
 ```
 
 Redirect everything. Do NOT use `tee` or let output flood your context.

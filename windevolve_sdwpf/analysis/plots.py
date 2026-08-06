@@ -181,7 +181,7 @@ def build_module(model, point):
     mod = sw.load_baseline(spec["path"])
     overrides = dict(point["overrides"])
     if point["fit"] is not None and spec["prepare"] is not None:
-        cache_dir = os.path.join(sw.SWEEP_DIR, "artefacts", model)
+        cache_dir = os.path.join(sw.SWEEP_DIR, "artifacts", model)
         os.makedirs(cache_dir, exist_ok=True)
         fit_over, _ = spec["prepare"](point["fit"], mod, cache_dir)
         overrides.update(fit_over)
@@ -659,6 +659,324 @@ def stage_summary(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Stage 4: regime analysis -- where in the horizon, and in what power state,
+# does each model actually win?
+# ---------------------------------------------------------------------------
+# Bins on the turbine's power at the forecast origin. Physical rather than
+# quantile bins, because the question is about named regimes -- "parked",
+# "near rated" -- and quantile edges would move between runs and make two
+# reports incomparable. SDWPF turbines are ~1500 kW rated.
+POWER_BINS = [(-1e9, 30.0, "parked (<30 kW)"),
+              (30.0, 300.0, "low (30-300)"),
+              (300.0, 800.0, "mid (300-800)"),
+              (800.0, 1200.0, "high (800-1200)"),
+              (1200.0, 1e9, "near rated (>1200)")]
+
+
+def origin_power(infile, capacity=CAPACITY):
+    """
+    Description:
+        Each turbine's power state at the forecast origin, taken as the mean of
+        the final hour of the input window rather than the single last reading.
+        One 10-minute sample is noisy and occasionally a dropout; an hourly mean
+        is the same quantity with less measurement noise, which matters because
+        it is being used to define regime boundaries.
+    Args:
+        infile: path to a window's NNNNin.csv
+        capacity: number of turbines
+    Returns:
+        A (capacity,) float array of recent mean Patv in kW.
+    """
+    df = pd.read_csv(infile, usecols=["Patv"])
+    total = len(df) // capacity
+    patv = np.nan_to_num(df["Patv"].to_numpy(dtype=float), nan=0.0)
+    return patv.reshape(capacity, total)[:, -6:].mean(axis=1)
+
+
+def _bin_index(values):
+    """Map origin powers onto POWER_BINS indices."""
+    idx = np.full(len(values), -1, dtype=int)
+    for b, (lo, hi, _) in enumerate(POWER_BINS):
+        idx[(values >= lo) & (values < hi)] = b
+    return idx
+
+
+def _regime_tensors(models, windows):
+    """
+    Description:
+        Accumulate masked absolute error, and the mean predicted and actual
+        trajectories, split by origin-power regime and horizon step.
+    Args:
+        models: list of model keys with cached predictions
+        windows: list of window indices
+    Returns:
+        (err, pred, truth, count) where err/pred are
+        {model: (n_bins, 288)} in MW, truth is (n_bins, 288), and count is
+        (n_bins,) turbine-windows per regime.
+    """
+    by_idx = {i: (a, b) for i, a, b in list_windows()}
+    nb = len(POWER_BINS)
+    err = {m: np.zeros((nb, OUTPUT_LEN)) for m in models}
+    pred = {m: np.zeros((nb, OUTPUT_LEN)) for m in models}
+    den = np.zeros((nb, OUTPUT_LEN))
+    truth_sum = np.zeros((nb, OUTPUT_LEN))
+    count = np.zeros(nb)
+
+    for w in windows:
+        infile, outfile = by_idx[w]
+        t, valid = ground_truth(outfile)
+        bins = _bin_index(origin_power(infile))
+        for b in range(nb):
+            rows = np.where(bins == b)[0]
+            if not len(rows):
+                continue
+            v = valid[rows]
+            den[b] += v.sum(axis=0)
+            truth_sum[b] += np.nansum(np.where(v, t[rows], 0.0), axis=0)
+            count[b] += len(rows)
+            for m in models:
+                p = load_pred(m, w)[rows]
+                err[m][b] += np.nansum(np.where(v, np.abs(p - t[rows]), 0.0), axis=0)
+                pred[m][b] += np.nansum(np.where(v, p, 0.0), axis=0)
+
+    d = np.maximum(den, 1.0)
+    for m in models:
+        err[m] = err[m] / d / 1000.0            # kW -> MW
+        pred[m] = pred[m] / d
+    return err, pred, truth_sum / d, count
+
+
+def fig_regime_horizon(models, err, count, outpath, smooth=6):
+    """
+    Description:
+        Error against horizon, one panel per origin-power regime. This is the
+        figure that tests the claim that a neural net and a tree fail in
+        different places: if the GRU wins in mid-power states and loses at the
+        extremes, the curves will cross, and they will cross at different
+        horizons in different panels.
+    Args:
+        models: list of model keys
+        err: {model: (n_bins, 288)} mean |error| in MW
+        count: (n_bins,) turbine-windows per regime
+        outpath: PNG path
+    Returns:
+        None
+    """
+    nb = len(POWER_BINS)
+    fig, axes = plt.subplots(1, nb, figsize=(3.4 * nb, 3.6), squeeze=False, sharex=True)
+    for b in range(nb):
+        ax = axes[0][b]
+        for m in models:
+            ax.plot(_hours(), _smooth(err[m][b], smooth), color=COLOURS[m],
+                    lw=1.5, label=NICE[m])
+        ax.set_title("{}\nn={:,}".format(POWER_BINS[b][2], int(count[b])), fontsize=9)
+        ax.set_xlabel("horizon (h)")
+        ax.set_xlim(0, 48)
+        ax.grid(alpha=0.25, lw=0.5)
+        if b == 0:
+            ax.set_ylabel("Mean |error| per turbine (MW)")
+            ax.legend(fontsize=7)
+    fig.suptitle("Where each model fails: error by horizon and power state at the "
+                 "forecast origin", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def fig_regime_winner(models, err, outpath):
+    """
+    Description:
+        Which model has the lowest error in each (regime, horizon) cell, and by
+        how much. The colour is the winner; the annotation is its margin over
+        the runner-up, in MW. A margin near zero means the cell is a tie and the
+        winner should not be read as a result.
+    Args:
+        models: list of model keys
+        err: {model: (n_bins, 288)} mean |error| in MW
+        outpath: PNG path
+    Returns:
+        None
+    """
+    buckets = [(0, 36, "0-6h"), (36, 72, "6-12h"), (72, 144, "12-24h"),
+               (144, 216, "24-36h"), (216, 288, "36-48h")]
+    nb, nh = len(POWER_BINS), len(buckets)
+    stack = np.stack([np.array([err[m][:, lo:hi].mean(axis=1)
+                                for lo, hi, _ in buckets]).T for m in models])
+    win = np.argmin(stack, axis=0)                       # (n_bins, n_buckets)
+    srt = np.sort(stack, axis=0)
+    margin = srt[1] - srt[0] if len(models) > 1 else np.zeros_like(srt[0])
+
+    fig, ax = plt.subplots(figsize=(1.5 * nh + 3, 0.75 * nb + 2.2))
+    cmap = matplotlib.colors.ListedColormap([COLOURS[m] for m in models])
+    ax.imshow(win, cmap=cmap, vmin=0, vmax=max(len(models) - 1, 1), aspect="auto")
+    for b in range(nb):
+        for h in range(nh):
+            ax.text(h, b, "{}\n+{:.3f}".format(NICE[models[win[b, h]]].split()[0],
+                                                margin[b, h]),
+                    ha="center", va="center", fontsize=7, color="white")
+    ax.set_xticks(range(nh))
+    ax.set_xticklabels([lab for _, _, lab in buckets])
+    ax.set_yticks(range(nb))
+    ax.set_yticklabels([lab for _, _, lab in POWER_BINS], fontsize=8)
+    ax.set_xlabel("Forecast horizon")
+    ax.set_ylabel("Power at forecast origin")
+    ax.set_title("Best model per regime (margin over runner-up, MW)", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def fig_regime_decay(models, pred, truth, outpath, smooth=6):
+    """
+    Description:
+        The mean forecast TRAJECTORY from each starting regime, with the actual
+        mean trajectory overlaid. This tests the steepness claim directly: a
+        model whose short-horizon curve is "too steep" from a high or low
+        starting state will revert toward the middle faster than the truth
+        does, and that shows up here as a curve that falls (or rises) away from
+        the black line in the first few hours.
+
+        This is a different question from the error plot. A model can have a
+        good average error while systematically mis-shaping its trajectory,
+        because over- and under-shoots cancel in the mean absolute error but not
+        in the mean prediction.
+    Args:
+        models: list of model keys
+        pred: {model: (n_bins, 288)} mean predicted power in kW
+        truth: (n_bins, 288) mean actual power in kW
+        outpath: PNG path
+    Returns:
+        None
+    """
+    nb = len(POWER_BINS)
+    fig, axes = plt.subplots(1, nb, figsize=(3.4 * nb, 3.6), squeeze=False, sharex=True)
+    for b in range(nb):
+        ax = axes[0][b]
+        ax.plot(_hours(), _smooth(truth[b], smooth), color=COLOURS["actual"],
+                lw=2.0, label="Actual", zorder=5)
+        for m in models:
+            ax.plot(_hours(), _smooth(pred[m][b], smooth), color=COLOURS[m],
+                    lw=1.4, label=NICE[m])
+        ax.set_title(POWER_BINS[b][2], fontsize=9)
+        ax.set_xlabel("horizon (h)")
+        ax.set_xlim(0, 48)
+        ax.grid(alpha=0.25, lw=0.5)
+        if b == 0:
+            ax.set_ylabel("Mean power (kW)")
+            ax.legend(fontsize=7)
+    fig.suptitle("Mean forecast trajectory by starting regime -- is the "
+                 "short-horizon curve too steep?", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.savefig(outpath, dpi=150)
+    plt.close(fig)
+
+
+def _regime_tables(models, err, pred, truth, count):
+    """Write the regime numbers as markdown, ready to paste into the report."""
+    out = os.path.join(PLOT_DIR, "regime_tables.md")
+    buckets = [(0, 36, "0-6h"), (36, 72, "6-12h"), (72, 144, "12-24h"),
+               (144, 216, "24-36h"), (216, 288, "36-48h")]
+    with open(out, "w") as fh:
+        fh.write("### Mean |error| (MW) by power regime and horizon\n\n")
+        fh.write("| regime | n | model | " + " | ".join(l for _, _, l in buckets) + " |\n")
+        fh.write("|---|---|---|" + "---|" * len(buckets) + "\n")
+        for b, (_, _, lab) in enumerate(POWER_BINS):
+            for m in models:
+                cells = ["{:.4f}".format(err[m][b, lo:hi].mean()) for lo, hi, _ in buckets]
+                fh.write("| {} | {:,} | {} | {} |\n".format(
+                    lab, int(count[b]), NICE[m], " | ".join(cells)))
+
+        fh.write("\n### Crossover: first horizon where each model overtakes the "
+                 "best-at-h=1 model\n\n")
+        fh.write("| regime | leader at h=1 | overtaken by | at horizon |\n")
+        fh.write("|---|---|---|---|\n")
+        for b, (_, _, lab) in enumerate(POWER_BINS):
+            first = min(models, key=lambda m: err[m][b, :6].mean())
+            row = "| {} | {} | ".format(lab, NICE[first])
+            beat = None
+            for h in range(6, OUTPUT_LEN):
+                better = [m for m in models if err[m][b, h] < err[first][b, h]]
+                if better:
+                    beat = (min(better, key=lambda m: err[m][b, h]), h / 6.0)
+                    break
+            fh.write(row + ("{} | {:.1f} h |\n".format(NICE[beat[0]], beat[1])
+                            if beat else "never | -- |\n"))
+
+        fh.write("\n### Trajectory bias at short horizon (mean predicted minus "
+                 "mean actual, kW, averaged over 0-6h)\n\n")
+        fh.write("A negative value means the model decays away from its starting "
+                 "state faster than reality does; positive means it holds on too "
+                 "long.\n\n")
+        fh.write("| regime | " + " | ".join(NICE[m] for m in models) + " |\n")
+        fh.write("|---|" + "---|" * len(models) + "\n")
+        for b, (_, _, lab) in enumerate(POWER_BINS):
+            cells = ["{:+.1f}".format((pred[m][b, :36] - truth[b, :36]).mean())
+                     for m in models]
+            fh.write("| {} | {} |\n".format(lab, " | ".join(cells)))
+    print("wrote {}".format(out))
+
+
+def _smooth(y, steps):
+    """
+    Description:
+        Light moving average along the horizon axis. Conditional means are taken
+        over far fewer samples than the aggregate ones -- a regime holding a few
+        dozen turbine-windows is visibly noisy -- and the question being asked
+        is about the SHAPE of the curve, which survives smoothing while the
+        sampling jitter does not. Edges use a shrinking window rather than
+        padding, so the first and last points are not dragged toward zero.
+    Args:
+        y: 1-D array over horizon steps
+        steps: window width in 10-minute steps (0 or 1 disables)
+    Returns:
+        The smoothed array.
+    """
+    if not steps or steps < 2:
+        return y
+    k = int(steps)
+    out = np.empty_like(y, dtype=float)
+    for i in range(len(y)):
+        lo, hi = max(0, i - k // 2), min(len(y), i + k // 2 + 1)
+        out[i] = y[lo:hi].mean()
+    return out
+
+
+def stage_regimes(args):
+    """
+    Description:
+        Run the regime analysis: split every turbine-window by the power at its
+        forecast origin, then compare models within each regime rather than in
+        aggregate. A single headline score hides the possibility that two models
+        with near-identical totals are winning in completely different places --
+        which is exactly what a portfolio or per-regime ensemble would exploit.
+    Args:
+        args: parsed CLI namespace
+    Returns:
+        0
+    """
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    windows = [int(x) for x in args.windows.split(",")]
+    models = available_models(windows)
+    if not models:
+        raise SystemExit("no cached predictions for windows {}. Run: "
+                         "python analysis/plots.py predict".format(windows))
+    print("models: {}".format(", ".join(models)))
+    err, pred, truth, count = _regime_tensors(models, windows)
+    for b, (_, _, lab) in enumerate(POWER_BINS):
+        print("  {:<22} {:>7,} turbine-windows".format(lab, int(count[b])))
+
+    fig_regime_horizon(models, err, count,
+                       os.path.join(PLOT_DIR, "regime_error.png"), args.smooth)
+    fig_regime_winner(models, err, os.path.join(PLOT_DIR, "regime_winner.png"))
+    fig_regime_decay(models, pred, truth,
+                     os.path.join(PLOT_DIR, "regime_decay.png"), args.smooth)
+    _regime_tables(models, err, pred, truth, count)
+    print("wrote regime_error.png, regime_winner.png, regime_decay.png -> {}".format(
+        PLOT_DIR))
+    return 0
+
+
 def _axis_values(sub):
     """Extract a numeric x value from each label, or None if that fails."""
     xs = []
@@ -696,7 +1014,8 @@ def main():
     """CLI entry point."""
     ap = argparse.ArgumentParser(description="Baseline report figures.")
     ap.add_argument("stage",
-                    choices=["predict", "figures", "sweeps", "summary", "all"])
+                    choices=["predict", "figures", "sweeps", "summary",
+                             "regimes", "all"])
     ap.add_argument("--models", default="naive,climatology,arma,gbdt,gru",
                     help="comma-separated model keys (predict stage)")
     ap.add_argument("--windows", default="1,12,24",
@@ -706,6 +1025,9 @@ def main():
     ap.add_argument("--best", action="store_true",
                     help="plot each model at its best VALIDATION configuration "
                          "from its sweep TSV instead of the reference point")
+    ap.add_argument("--smooth", type=int, default=6,
+                    help="moving-average width in 10-min steps for the regime "
+                         "curves (6 = 1 hour; 0 disables). Tables are never smoothed")
     ap.add_argument("--label", default=None,
                     help="plot one explicit grid label (single model only)")
     args = ap.parse_args()
@@ -716,6 +1038,8 @@ def main():
         stage_figures(args)
     if args.stage in ("sweeps", "all"):
         stage_sweeps(args)
+    if args.stage in ("regimes", "all"):
+        stage_regimes(args)
     if args.stage in ("summary", "all"):
         stage_summary(args)
     return 0

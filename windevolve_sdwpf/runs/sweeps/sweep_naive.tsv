@@ -1,0 +1,20 @@
+ts	model	axis	label	config	score	rmse	mae	latest_rmse	n_windows	eval_seconds	fit_seconds	valid	reason
+2026-08-05T19:44:38	naive	lag	lag=144	{"LAG": 144, "scale": 1.0}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:44:38	naive	lag	lag=2	{"LAG": 2, "scale": 1.0}							0.0	0	MetricsError: 76.87% turbines with zero predicted values (in 0th prediction)!
+2026-08-05T19:44:38	naive	lag	lag=6	{"LAG": 6, "scale": 1.0}							0.0	0	MetricsError: 54.48% turbines with zero predicted values (in 0th prediction)!
+2026-08-05T19:44:39	naive	lag	lag=18	{"LAG": 18, "scale": 1.0}							0.0	0	MetricsError: 100.00% turbines with (almost) identical predicted values (2th prediction)!
+2026-08-05T19:44:39	naive	lag	lag=36	{"LAG": 36, "scale": 1.0}							0.0	0	MetricsError: 19.40% turbines with zero predicted values (in 2th prediction)!
+2026-08-05T19:44:40	naive	lag	lag=72	{"LAG": 72, "scale": 1.0}							0.0	0	MetricsError: 19.40% turbines with zero predicted values (in 2th prediction)!
+2026-08-05T19:44:46	naive	lag	lag=288	{"LAG": 288, "scale": 1.0}	68.6527	75.3799	61.9255	76.4385	24	5.85	0.0	1	
+2026-08-05T19:44:52	naive	lag	lag=432	{"LAG": 432, "scale": 1.0}	59.4239	66.3208	52.527	64.0829	24	5.84	0.0	1	
+2026-08-05T19:44:57	naive	lag	lag=1008	{"LAG": 1008, "scale": 1.0}	63.1149	70.5874	55.6424	66.7266	24	5.81	0.0	1	
+2026-08-05T19:45:03	naive	lag	lag=2016	{"LAG": 2016, "scale": 1.0}	62.7603	68.9568	56.5639	67.1377	24	5.83	0.0	1	
+2026-08-05T19:45:05	naive	scale	lag=144 scale=1.0	{"LAG": 144, "scale": 1.0}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:06	naive	scale	lag=144 scale=0.9	{"LAG": 144, "scale": 0.9}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:08	naive	scale	lag=144 scale=0.8	{"LAG": 144, "scale": 0.8}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:10	naive	scale	lag=144 scale=0.7	{"LAG": 144, "scale": 0.7}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:12	naive	scale	lag=144 scale=0.6	{"LAG": 144, "scale": 0.6}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:13	naive	scale	lag=144 scale=0.5	{"LAG": 144, "scale": 0.5}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:15	naive	scale	lag=144 scale=0.4	{"LAG": 144, "scale": 0.4}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:16	naive	scale	lag=144 scale=0.3	{"LAG": 144, "scale": 0.3}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!
+2026-08-05T19:45:18	naive	scale	lag=144 scale=0.2	{"LAG": 144, "scale": 0.2}							0.0	0	MetricsError: 66.42% turbines with zero predicted values (in 6th prediction)!

@@ -33,7 +33,7 @@ So the model learns: "given the recent state, and that I am predicting *h* steps
 
 ## How the training data is built (step by step)
 
-The model learns from thousands of question-and-answer examples, all taken from the 245-day training CSV. One example is:
+The model learns from thousands of question-and-answer examples, all taken from the training CSV — which by default is `val_train.csv`, the file truncated to end before the validation period (days 1–197), **not** the full 245-day file. Fitting on the full file would train the model on its own validation targets. One example is:
 
 - **Question (features):** numbers describing "now" (the origin) plus how far ahead we are asking (the horizon `h`).
 - **Answer (target):** the actual power `h` steps after "now" — which we can simply look up, because it is historical data.
@@ -96,7 +96,7 @@ At forecast time the trees are fixed. For one input row, prediction is just the 
 prediction = P0 + lr · (T1(row) + T2(row) + ... + TN(row))
 ```
 
-For a full forecast, one turbine's `(288, 12)` feature matrix (every horizon `h = 1..288`, no striding) is passed through all `N` trees at once, giving 288 power values. Repeat for 134 turbines, clip negatives to zero, and return `(134, 288, 1)`.
+For a full forecast, one turbine's `(288, n_features)` matrix (every horizon `h = 1..288`, no striding) is passed through all `N` trees at once, giving 288 power values. `n_features` depends on the feature tier the model was trained with — 12 for the default `base` tier, up to 31 for `xy`; see "Feature tiers" below. Repeat for 134 turbines, clip negatives to zero, and return `(134, 288, 1)`.
 
 ## Features
 
@@ -133,14 +133,14 @@ Subsampling is necessary: 134 turbines × ~30,000 origins × 288 horizons is far
 ## Usage
 
 ```bash
-# Train the global model (writes gbdt_model.joblib)
-python baseline_models/tree/baseline_gbdt.py --origins 150
+# Train the global model (writes gbdt_model.joblib beside the .py)
+python baselines/tree/baseline_gbdt.py --origins 150
 
 # Score with the official metric
-python evaluator.py baseline_models/tree/baseline_gbdt.py
+python evaluation/evaluator.py baselines/tree/baseline_gbdt.py
 
 # A quicker, smaller model for testing
-python baseline_models/tree/baseline_gbdt.py --origins 50 --trees 100
+python baselines/tree/baseline_gbdt.py --origins 50 --trees 100
 ```
 
 ## Weaknesses

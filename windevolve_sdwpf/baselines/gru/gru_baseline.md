@@ -287,58 +287,76 @@ One caution when reading results: a score from `evaluator.py` is a **validation*
 
 ---
 
-## 8. Parameters added for the sweep, and the two GRUs
+## 8. This project's GRU is the CORRECTED loop
 
-Section 6 lists eight deviations from a normal PyTorch loop, all reproduced
-because the official code does them. Four of those are now **switchable**, so
-their cost can be measured rather than argued about. Every switch defaults to
-the official behaviour, so nothing above changes unless a switch is flipped.
+Section 6 lists eight deviations from a normal PyTorch loop, reproduced because
+the official Baidu code does them. **Four of those are now fixed by default.**
+The purpose of this baseline is to be a comparator for the evolutionary search
+and a candidate seed program -- not to reproduce a published number -- so a
+knowingly-broken training loop is the wrong default.
 
-| Setting | Official (default) | Corrected | What the official actually does |
+| Setting | Default (corrected) | `--official` | What the official actually does |
 |---|---|---|---|
-| `zero_grad` | `False` | `True` | Never calls `clear_grad()`, so the gradient buffer accumulates across every batch **and every epoch** — by batch *n* the applied gradient is the sum of all *n* preceding ones |
-| `double_step` | `True` | `False` | Paddle's `minimize()` already updates and the loop calls `step()` too: two Adam applications per batch |
-| `global_clip` | `False` | `True` | Clips each parameter tensor separately (`ClipGradByNorm`) rather than the global norm |
-| `eval_val` | `False` | `True` | Validation runs with dropout live, so the early-stopping signal is noisy |
-| `shuffle_val` | `True` | `False` | Shuffles the validation loader with `drop_last`, discarding a different random subset every epoch |
+| `zero_grad` | `True` | `False` | Never calls `clear_grad()`, so the gradient buffer accumulates across every batch **and every epoch** -- by batch *n* the applied gradient is the sum of all *n* preceding ones. The worst of the four. |
+| `double_step` | `False` | `True` | Paddle's `minimize()` already updates and the loop calls `step()` too: two Adam applications per batch |
+| `global_clip` | `True` | `False` | Clips each parameter tensor separately rather than the global norm |
+| `eval_val` | `True` | `False` | Validation runs with dropout live, so early stopping reads noise |
+| `shuffle_val` | `False` | `True` | Shuffles the validation loader with `drop_last`, discarding a different random subset every epoch |
+| `per_turbine_seed` | `True` | `False` | Seeds ONCE before the turbine loop, so turbine 100's weights depend on turbines 0-99 having drawn first |
+| `INFER_DROPOUT` | `False` | `True` | Never calls `model.eval()`, so predictions are stochastic |
 
-`--fixed-loop` flips all five together. Architecture and optimisation knobs were
-also exposed: `hidden` (48), `lstm_layer` (2), `input_len` (144), `dropout`
-(0.05), `lr` (1e-4), `lr_decay` (0.5), all defaulting to the official values,
-plus `--input-len`, `--hidden`, `--layers`, `--dropout`, `--lr`, `--lr-decay`.
+`--official` restores all of them together. Use it only to reproduce the
+published **47.850**, and never label a corrected run "the official baseline".
 
-### Which GRU is the baseline
+### Two consequences of per-turbine seeding
 
-**The corrected loop.** The purpose of the baseline suite in this project is to
-provide a comparator for the evolutionary search and a plausible seed program,
-not to reproduce a published number — and a knowingly-broken training loop is
-the wrong default for either job.
+Seeding from `OFFICIAL_FIX_SEED + tid` inside each turbine, rather than once
+before the loop, changes two things for the better:
 
-The official loop stays in the sweep as one point. It costs nothing (the
-existing checkpoints are reused) and it documents the provenance: it is the row
-that connects this project to the published **47.850**. Anything trained with
-`--fixed-loop` must **not** be labelled "the official baseline"; report it as a
-corrected reimplementation and keep the official row beside it.
+- **A partial run is now reproducible.** Training turbines 0-9 gives the same
+  weights whether or not turbines 10-133 were trained. Under the official
+  scheme it did not, which is why `forecast()` used to warn about partial
+  checkpoints.
+- **Turbines can be trained in parallel.** The loop is launch-bound rather than
+  compute-bound -- 22,801 parameters at batch 32 barely occupies a GPU -- so
+  sharding with `--turbines` across several concurrent processes is close to a
+  linear speedup. A full 134-turbine pass drops from ~40 min to ~7-10 min
+  across 4-6 shards.
+
+```
+python baselines/gru/gru_baseline.py --turbines 0-33  --checkpoints ckpt_dir &
+python baselines/gru/gru_baseline.py --turbines 34-66 --checkpoints ckpt_dir &
+python baselines/gru/gru_baseline.py --turbines 67-99 --checkpoints ckpt_dir &
+python baselines/gru/gru_baseline.py --turbines 100-133 --checkpoints ckpt_dir &
+wait
+```
+
+All four write into one folder; each writes only its own `model_<tid>.pt`.
+
+### Exposed hyperparameters
+
+`hidden` (48), `lstm_layer` (2), `input_len` (144), `dropout` (0.05), `lr`
+(1e-4), `lr_decay` (0.5), `train_epochs` (10), `patience` (3), `batch_size`
+(32) -- with CLI flags `--hidden`, `--layers`, `--input-len`, `--dropout`,
+`--lr`, `--lr-decay`, `--epochs`, `--batch-size`.
+
+Three defaults are worth suspicion:
+
+- **`input_len = 144`.** The model reads 24 h and predicts 48 h. Forecasting two
+  days from one is the most questionable choice in the file.
+- **`hidden = 48`** gives 22,801 parameters per turbine, tiny by modern
+  standards, and nothing is shared across the 134 models.
+- **`lr = 1e-4` with `lr_decay = 0.5`** is roughly 1/500th of its starting value
+  by epoch 10, so the model may stop learning well before it converges. Raising
+  `lr` and slowing `lr_decay` are one experiment, not two.
 
 ### On the earlier, better-scoring version
 
 An earlier implementation of this file was an ordinary PyTorch loop and scored
-better. That is the expected direction — deviations 3 and 4 alone are enough to
-explain it. But the two numbers should **not** be differenced, because more than
-the loop changed between them: the scorer moved from the development
-`metrics.py` to the real submission grader (about 4.5% apart on identical
-inputs, larger than the whole spread of the baseline table), and the evaluation
-data may have moved between the validation tail and `final_phase_test`, which
-Section 7 warns are not comparable. The `train_loop` axis of
-`analysis/sweep.py` resolves it properly: both loops, one split, one grader.
-
-### Notes on the exposed knobs
-
-- **`input_len` is the most suspicious default.** The model reads 144 steps
-  (24 h) and predicts 288 (48 h) — it forecasts two days from one.
-- **`hidden = 48` gives 22,801 parameters per turbine**, tiny by modern
-  standards, and nothing is shared between the 134 models.
-- **The LR schedule may stop training early.** `lr` starts at 1e-4 and halves
-  every epoch, so by epoch 10 it is roughly 1/500th of its starting value.
-- Architecture and optimiser points in the sweep run on the **corrected** loop,
-  so a capacity result is not confounded with a broken optimizer.
+better -- the expected direction, since deviations 3 and 4 alone explain it.
+But those two numbers should **not** be differenced: the scorer also moved from
+the development `metrics.py` to the real submission grader (about 4.5% apart on
+identical inputs, larger than the whole spread of the baseline table), and the
+evaluation data may have moved between the validation tail and
+`final_phase_test`, which Section 7 warns are not comparable. The `provenance`
+point of `analysis/sweep.py` settles it: both loops, one split, one grader.

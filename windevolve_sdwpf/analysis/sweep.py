@@ -379,99 +379,110 @@ def grid_gbdt():
 def grid_gru():
     """
     Description:
-        Per-turbine GRU. Two kinds of axis, with very different price tags.
+        Per-turbine GRU -- a REAL training sweep. Every axis below except
+        `provenance` and `scale` retrains all 134 models, because that is what
+        a hyperparameter is: something the model learns differently under.
 
-        FREE (reuse the existing checkpoints, one validation pass each):
+        The corrected training loop is now the default (gru_baseline.py), so
+        nothing here is fighting a broken optimizer. The goal is a GRU that
+        performs as well as this model family reasonably can, not one that
+        reproduces a published number.
 
-          seed        the official predict.py never calls model.eval(), so
-                      dropout is LIVE at inference and forecast() is stochastic.
-                      Five draws. Run this FIRST: until the spread is known, no
-                      other row in the baseline table can be read as a
-                      difference rather than as noise.
-          infer_mode  the same five draws with dropout off. Quantifies how much
-                      of the published number is inference noise.
-          clip        clamp negative predictions to zero. About a third of real
-                      SDWPF Patv readings are negative (idling turbines draw
-                      power), so this is not obviously an improvement.
-          scale       uniform shrinkage -- the metric-calibration control.
+        COST. One point = 134 small models. Sequentially that is ~40 min; the
+        workload is launch-bound rather than compute-bound, so sharding with
+        --turbines across 4-6 concurrent processes brings it to ~7-10 min.
+        Per-turbine seeding (default) is what makes that sharding valid.
 
-        EXPENSIVE (retrain all 134 models, ~1 GPU-hour per point). Opt in
-        explicitly with --only; do not launch these by accident.
+        Axes, in the order worth running them:
 
-          train_loop    the official loop has four outright defects, faithfully
-                        reproduced here: gradients are never zeroed (they
-                        accumulate across every batch AND every epoch), the
-                        optimizer is applied twice per batch, clipping is
-                        per-parameter rather than global, and validation runs
-                        with dropout live so early stopping reads a noisy
-                        signal. `fixed` corrects all four. This is the single
-                        most informative GRU point in the report -- and its
-                        result is NOT the published baseline, so it has to be
-                        reported as a separate model rather than as a tuned
-                        version of this one.
-          architecture  the official reads 144 steps (24h) to predict 288 (48h)
-                        with 48 hidden units: 22,801 parameters per turbine.
-                        Both are plausibly too small. Run on the FIXED loop, so
-                        a capacity result is not confounded with a broken
-                        optimizer.
-          optim         lr is 1e-4 halving every epoch, so by epoch 10 it is
-                        ~1/500th of its starting value and the model has
-                        effectively stopped learning. Tests whether it ever
-                        finished training in the first place.
+          capacity   hidden 48 -> 96 -> 128, and 1 vs 2 layers. The official 48
+                     hidden units is 22,801 parameters per turbine, which is
+                     tiny, and nothing is shared between the 134 models.
+          input_len  144 -> 288 -> 432. THE most suspicious default: the model
+                     reads 24h of history and predicts 48h. Expect this to
+                     matter more than capacity.
+          optim      lr and its decay. The official 1e-4 halving every epoch is
+                     ~1/500th of its start by epoch 10, so the model may simply
+                     stop learning before it converges. Test lr and decay
+                     together -- a higher lr with fast decay is not the same
+                     experiment as a higher lr held flat.
+          budget     epochs and patience. With the decay fixed, does more
+                     training help, or is early stopping firing for a reason?
+          batch      16 / 32 / 64 / 128. Interacts with lr, so read it against
+                     the optim axis rather than alone.
+          dropout    0.0 / 0.05 / 0.2. 134 independent models on one turbine's
+                     data each is a regime where regularisation might matter.
+          provenance the official loop, defects and all. One point, kept so the
+                     report can connect to the published 47.850. NOT a tuning
+                     point -- never fold it into "best tuned".
+          scale      the shrinkage control. No retrain.
     Args:
         None
     Returns:
         A list of grid points.
     """
-    FIXED = {"zero_grad": True, "double_step": False, "global_clip": True,
-             "eval_val": True, "shuffle_val": False}
-    pts = []
-    for s_ in [1, 2, 3, 4, 5]:
-        pts.append(_point("seed", "dropout-on seed={}".format(s_),
-                          {"INFER_SEED": str(s_)}))
-    for s_ in [1, 2, 3, 4, 5]:
-        pts.append(_point("infer_mode", "dropout-off seed={}".format(s_),
-                          {"INFER_SEED": str(s_), "_SWEEP_EVAL_MODE": True}))
-    for s_ in [1, 2, 3]:
-        pts.append(_point("clip", "clip-negative seed={}".format(s_),
-                          {"INFER_SEED": str(s_), "CLIP_NEGATIVE": True}))
-    for sc in SCALES:
-        pts.append(_point("scale", "seed=1 scale={}".format(sc),
-                          {"INFER_SEED": "1"}, scale=sc))
+    def T(**kw):
+        """One retraining point: settings overrides for train_one_turbine."""
+        return {"settings": kw}
 
-    # --- retraining axes ---------------------------------------------------
-    pts.append(_point("train_loop", "official loop",
-                      {"INFER_SEED": "1"}, fit={"settings": {}}))
-    pts.append(_point("train_loop", "fixed loop",
-                      {"INFER_SEED": "1", "_SWEEP_EVAL_MODE": True},
-                      fit={"settings": dict(FIXED)}))
-    for name, extra in [("input_len=288", {"input_len": 288}),
-                        ("input_len=432", {"input_len": 432}),
-                        ("hidden=96", {"hidden": 96}),
-                        ("layers=1", {"lstm_layer": 1})]:
-        cfg = dict(FIXED)
-        cfg.update(extra)
-        pts.append(_point("architecture", "fixed " + name,
-                          {"INFER_SEED": "1", "_SWEEP_EVAL_MODE": True},
-                          fit={"settings": cfg}))
-    for name, extra in [("lr=1e-3", {"lr": 1e-3}),
-                        ("no-decay 20ep", {"lr_decay": 1.0, "train_epochs": 20})]:
-        cfg = dict(FIXED)
-        cfg.update(extra)
-        pts.append(_point("optim", "fixed " + name,
-                          {"INFER_SEED": "1", "_SWEEP_EVAL_MODE": True},
-                          fit={"settings": cfg}))
+    pts = [_point("capacity", "hidden=48 layers=2 (default)", fit=T())]
+
+    for h in [96, 128]:
+        pts.append(_point("capacity", "hidden={}".format(h), fit=T(hidden=h)))
+    pts.append(_point("capacity", "layers=1", fit=T(lstm_layer=1)))
+    pts.append(_point("capacity", "hidden=96 layers=1", fit=T(hidden=96, lstm_layer=1)))
+
+    for il in [288, 432]:
+        pts.append(_point("input_len", "input_len={}".format(il), fit=T(input_len=il)))
+
+    for lr, dec, name in [(3e-4, 0.5, "lr=3e-4"), (1e-3, 0.5, "lr=1e-3"),
+                          (1e-4, 1.0, "lr=1e-4 flat"), (1e-3, 0.9, "lr=1e-3 decay=0.9")]:
+        pts.append(_point("optim", name, fit=T(lr=lr, lr_decay=dec)))
+
+    for ep, pat, name in [(20, 5, "20 epochs pat=5"), (40, 8, "40 epochs pat=8")]:
+        pts.append(_point("budget", name, fit=T(train_epochs=ep, patience=pat,
+                                                lr_decay=0.9)))
+
+    for bs in [16, 64, 128]:
+        pts.append(_point("batch", "batch={}".format(bs), fit=T(batch_size=bs)))
+
+    for dp in [0.0, 0.2]:
+        pts.append(_point("dropout", "dropout={}".format(dp), fit=T(dropout=dp)))
+
+    pts.append(_point("provenance", "official loop (defects)",
+                      {"INFER_DROPOUT": True},
+                      fit=T(zero_grad=False, double_step=True, global_clip=False,
+                            eval_val=False, shuffle_val=True,
+                            per_turbine_seed=False)))
+
+    # One combined point, from the best guess on each axis. A coordinate sweep
+    # does not license this -- confirm it against the coordinate results.
+    pts.append(_point("combined", "tuned combination",
+                      fit=T(hidden=96, input_len=288, lr=1e-3, lr_decay=0.9,
+                            train_epochs=20, patience=5)))
+
+    for sc in SCALES:
+        pts.append(_point("scale", "default scale={}".format(sc), scale=sc, fit=T()))
     return pts
 
 
 # ---------------------------------------------------------------------------
 # Prepare hooks: the fitting a configuration needs before it can be scored.
-# Each returns (overrides, fit_seconds). Artefacts are cached on a key derived
+# Each returns (overrides, fit_seconds). Artifacts are cached on a key derived
 # from the fit parameters, so re-running a sweep does not refit what it already
 # fitted -- and so the apply_steps and scale axes reuse one fit.
 # ---------------------------------------------------------------------------
 def prepare_arma(fit, module, cache_dir):
-    """Fit 134 per-turbine ARIMA models for one (order, fit_days), cached."""
+    """
+    Description:
+        Fit 134 per-turbine ARIMA models for one (order, fit_days), cached.
+    Args:
+        fit: the point's fit dict
+        module: the loaded baseline
+        cache_dir: where artifacts are cached
+    Returns:
+        ({"MODEL_PATH": path}, fit_seconds)
+    """
     order = tuple(fit["order"])
     fit_days = int(fit.get("fit_days", 197))
     key = "arma_p{}d{}q{}_f{}.joblib".format(order[0], order[1], order[2], fit_days)
@@ -489,12 +500,12 @@ def prepare_gbdt(fit, module, cache_dir):
     Description:
         Train one global XGBoost model for a configuration, cached. The cache
         key is built from EVERY fit parameter, so two feature tiers or two
-        objectives can never collide on one artefact -- a collision would
+        objectives can never collide on one artifact -- a collision would
         silently score the wrong model and look like a null result.
     Args:
         fit: the point's fit dict
         module: the loaded baseline
-        cache_dir: where artefacts are cached
+        cache_dir: where artifacts are cached
     Returns:
         ({"MODEL_PATH": path}, fit_seconds)
     """
@@ -507,20 +518,98 @@ def prepare_gbdt(fit, module, cache_dir):
     return {"MODEL_PATH": path}, time.perf_counter() - t0
 
 
+def _train_file_days():
+    """Whole days in the truncated training CSV the sweep fits on."""
+    rows = sum(1 for _ in open(VAL_TRAIN_FILE)) - 1
+    return int(round(rows / 134.0 / 144.0))
+
+
+def _checkpoints_match(ckpt_dir, capacity, want_days):
+    """
+    Description:
+        True only if ckpt_dir holds a complete set of checkpoints AND they were
+        trained on a file with `want_days` days. Anything else is refused, so a
+        245-day checkpoint can never be silently scored against a validation
+        split carved out of those same 245 days.
+    Args:
+        ckpt_dir: candidate checkpoint folder
+        capacity: number of turbines expected
+        want_days: day count the sweep's training file actually has
+    Returns:
+        bool
+    """
+    import torch as _torch
+    paths = [os.path.join(ckpt_dir, "model_{}.pt".format(i)) for i in range(capacity)]
+    if not all(os.path.exists(p) for p in paths):
+        return False
+    try:
+        blob = _torch.load(paths[0], map_location="cpu", weights_only=False)
+        got = int(blob.get("settings", {}).get("total_size", -1))
+    except Exception:
+        return False
+    if got != want_days:
+        print("  refusing to reuse {}: trained on a {}-day file, this sweep "
+              "fits on {} days".format(ckpt_dir, got, want_days))
+        return False
+    return True
+
+
+# Settings that map onto gru_baseline.py CLI flags, for sharded training.
+_GRU_FLAGS = {"hidden": "--hidden", "lstm_layer": "--layers",
+              "input_len": "--input-len", "dropout": "--dropout",
+              "lr": "--lr", "lr_decay": "--lr-decay",
+              "train_epochs": "--epochs", "batch_size": "--batch-size",
+              "patience": "--patience"}
+
+# Concurrent turbine shards. The training loop is launch-bound rather than
+# compute-bound -- 22,801 parameters at batch 32 barely occupies the GPU -- so
+# this is close to a linear speedup. Only valid because seeding is per-turbine
+# by default; the provenance point, which restores official single-stream
+# seeding, is forced to run sequentially.
+GRU_WORKERS = int(os.environ.get("SDWPF_GRU_WORKERS", "4"))
+
+
+def _gru_cli_flags(script):
+    """
+    Description:
+        The long option strings gru_baseline.py's parser accepts, read
+        statically from its source. Static parsing avoids importing torch just
+        to ask a question about argparse.
+    Args:
+        script: path to gru_baseline.py
+    Returns:
+        A set of flag strings, e.g. {"--hidden", "--lr-decay"}.
+    """
+    import ast as _ast
+    flags = set()
+    try:
+        tree = _ast.parse(open(script).read())
+    except Exception:
+        return flags
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call) and getattr(node.func, "attr", "") == "add_argument":
+            for arg in node.args:
+                if isinstance(arg, _ast.Constant) and str(arg.value).startswith("--"):
+                    flags.add(arg.value)
+    return flags
+
+
 def prepare_gru(fit, module, cache_dir):
     """
     Description:
         Train all 134 per-turbine GRUs for one configuration, cached.
 
-        THIS IS THE EXPENSIVE HOOK -- roughly an hour of GPU per point. It only
-        runs for the train_loop / architecture / optim axes; the seed,
-        infer_mode, clip and scale axes reuse the existing checkpoints and cost
-        one pass over the validation windows.
+        Sharded across GRU_WORKERS concurrent processes by default, each taking
+        a --turbines range and writing only its own model_<tid>.pt into the
+        shared folder. Valid because each turbine seeds itself from
+        OFFICIAL_FIX_SEED + tid, so a turbine's weights no longer depend on
+        which turbines ran before it.
 
-        The official seeding is reproduced: one seed, set once, before the
-        turbine loop, so every turbine's weights depend on the ones before it.
-        All 134 are trained in a single pass, so these are full runs and are not
-        stamped partial.
+        The provenance point sets per_turbine_seed=False to reproduce the
+        official single RNG stream, and is therefore trained SEQUENTIALLY in
+        one pass -- sharding it would not reproduce the stream it exists to
+        reproduce.
+
     Args:
         fit: the point's fit dict; fit["settings"] overrides default_settings()
         module: the loaded GRU baseline
@@ -529,46 +618,118 @@ def prepare_gru(fit, module, cache_dir):
         ({"CHECKPOINTS": dir}, fit_seconds)
     """
     import random as _random
+    import subprocess
     import torch as _torch
 
     overrides = fit.get("settings", {})
     capacity = 134
     t0 = time.perf_counter()
-
-    # The official arm is the baseline as already trained. If a complete set of
-    # checkpoints exists where the module expects them, reuse it rather than
-    # spending an hour of GPU reproducing what is already on disk.
-    if not overrides and all(
-            os.path.exists(os.path.join(module.CHECKPOINTS, "model_{}.pt".format(i)))
-            for i in range(capacity)):
-        return {}, 0.0
-
-    tag = "_".join("{}{}".format(k, v) for k, v in sorted(overrides.items())) or "official"
+    tag = "_".join("{}{}".format(k, v) for k, v in sorted(overrides.items())) or "default"
     ckpt = os.path.join(cache_dir, "ckpt_{}".format(tag))
-    if all(os.path.exists(os.path.join(ckpt, "model_{}.pt".format(i)))
-           for i in range(capacity)):
+
+    # PROVENANCE. Checkpoints are only reused when they were trained on the same
+    # file this sweep scores against. A checkpoint trained on the full 245-day
+    # CSV has seen the validation period, so scoring it here would be leakage --
+    # and nothing in the .pt filename says which file produced it. The saved
+    # settings do: resolve_day_sizes() writes the training file's real day count
+    # into settings["total_size"]. This is why the harness never falls back to
+    # the module's default CHECKPOINTS folder.
+    want_days = _train_file_days()
+    if _checkpoints_match(ckpt, capacity, want_days):
         return {"CHECKPOINTS": ckpt}, 0.0
 
+    os.makedirs(ckpt, exist_ok=True)
+    official = not overrides.get("per_turbine_seed", True)
+    print("  training 134 turbines [{}]: {}".format(
+        "sequential, official RNG stream" if official
+        else "{} shards".format(GRU_WORKERS),
+        ", ".join("{}={}".format(k, v) for k, v in sorted(overrides.items()))
+        or "defaults"), flush=True)
+
+    if not official and GRU_WORKERS > 1 and all(k in _GRU_FLAGS for k in overrides):
+        script = os.path.join(BASELINES_DIR, MODELS["gru"]["path"])
+        # Preflight. Launching eight processes only to have each die on an
+        # unknown argument wastes a minute and hides the cause, so check the
+        # flags against the script's own parser first.
+        have = _gru_cli_flags(script)
+        want = {_GRU_FLAGS[k] for k in overrides}
+        missing = sorted(want - have)
+        if missing:
+            raise RuntimeError(
+                "{} does not accept {}. The copy on disk is older than this "
+                "sweep expects -- re-import baselines/gru/gru_baseline.py.".format(
+                    os.path.basename(script), ", ".join(missing)))
+        edges = [round(i * capacity / GRU_WORKERS) for i in range(GRU_WORKERS + 1)]
+        log_dir = os.path.join(ckpt, "_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        procs = []
+        for lo, hi in zip(edges, edges[1:]):
+            if lo >= hi:
+                continue
+            cmd = [sys.executable, script, "--data", VAL_TRAIN_FILE,
+                   "--checkpoints", ckpt, "--turbines", "{}-{}".format(lo, hi - 1)]
+            for k, v in overrides.items():
+                cmd += [_GRU_FLAGS[k], str(v)]
+            log = os.path.join(log_dir, "shard_{}-{}.log".format(lo, hi - 1))
+            fh = open(log, "w")
+            fh.write("$ {}\n\n".format(" ".join(cmd)))
+            fh.flush()
+            procs.append((subprocess.Popen(cmd, stdout=fh,
+                                           stderr=subprocess.STDOUT), fh, log, cmd))
+        failed = []
+        for p, fh, log, cmd in procs:
+            rc = p.wait()
+            fh.close()
+            if rc != 0:
+                failed.append((rc, log, cmd))
+        if failed:
+            # Surface the real error rather than the fact that something failed.
+            rc, log, cmd = failed[0]
+            print("\n  SHARD FAILED (exit {}). Command was:\n    {}\n"
+                  "  Last lines of {}:".format(rc, " ".join(cmd), log), flush=True)
+            try:
+                with open(log) as fh:
+                    tail = fh.read().strip().splitlines()[-25:]
+                for line in tail:
+                    print("    | {}".format(line), flush=True)
+            except OSError:
+                print("    (log unreadable)", flush=True)
+            raise RuntimeError(
+                "{} of {} GRU training shards failed; see {}".format(
+                    len(failed), len(procs), log))
+        missing = [i for i in range(capacity)
+                   if not os.path.exists(os.path.join(ckpt, "model_{}.pt".format(i)))]
+        if missing:
+            raise RuntimeError("shards finished but {} checkpoints are missing "
+                               "(e.g. turbine {})".format(len(missing), missing[0]))
+        return {"CHECKPOINTS": ckpt}, time.perf_counter() - t0
+
+    # Sequential path: the provenance point, or anything not expressible as CLI
+    # flags.
     settings = module.default_settings()
     settings.update(overrides)
     settings["_full_run"] = True
-    os.makedirs(ckpt, exist_ok=True)
-
     device = module.pick_device()
     data = module.load_modeled_columns(VAL_TRAIN_FILE, settings["start_col"])
     module.resolve_day_sizes(data, settings)
-
-    seed = module.OFFICIAL_FIX_SEED
-    _random.seed(seed)
-    np.random.seed(seed)
-    _torch.manual_seed(seed)
-    if _torch.cuda.is_available():
-        _torch.cuda.manual_seed_all(seed)
-
+    if official:
+        seed = module.OFFICIAL_FIX_SEED
+        _random.seed(seed)
+        np.random.seed(seed)
+        _torch.manual_seed(seed)
+        if _torch.cuda.is_available():
+            _torch.cuda.manual_seed_all(seed)
     for tid in range(capacity):
         module.train_one_turbine(data, tid, settings, device, ckpt)
     return {"CHECKPOINTS": ckpt}, time.perf_counter() - t0
 
+
+_SCALE = ("Multiply every prediction by a constant. Not a hyperparameter -- a control. "
+          "The metric rewards shrinking an uninformative forecast toward the conditional "
+          "mean, and the evolutionary search will find that within a few generations. "
+          "Measuring it here means the search gets credit for discovery rather than for "
+          "calibration. Expect it to help the weak forecasters a lot and the strong ones "
+          "barely at all: a well-calibrated forecast has nothing to shrink toward.")
 
 # ---------------------------------------------------------------------------
 # What each axis is FOR. Read with `python analysis/sweep.py <model> --explain`.
@@ -580,22 +741,13 @@ def prepare_gru(fit, module, cache_dir):
 #           tuning   = looks for a better number and nothing else
 #   core    True  = runs by default
 #           False = only with --extended or an explicit --only
-#
-# The core/extended split exists because a baseline should be reasonable and
-# well-performing, not exhaustively tuned. Ablations stay in core because their
-# answers go in the report; tuning axes are trimmed to a few points, enough to
-# show the shape of the curve and to confirm the default is not badly wrong.
 # ---------------------------------------------------------------------------
-_SCALE = (
-    "Multiply every prediction by a constant. Not a hyperparameter -- a control. The metric rewards shrinking an uninformative forecast toward the conditional mean, and the evolutionary search will find that within a few generations. Measuring it here means the search gets credit for discovery rather than for calibration. Expect it to help the weak forecasters a lot and the strong ones barely at all: a well-calibrated forecast has nothing to shrink toward.")
-
 AXIS_INFO = {
     ("naive", "lag"): ("ablation", True,
         "How long a block of recent history is copied forward. lag=144 is 'tomorrow "
-        "looks like today', lag=288 is 'the next 48h looks like the last 48h'. lag=1 "
-        "is textbook persistence and is UNSCOREABLE -- it emits a constant per turbine "
-        "and the official identical-prediction guard rejects it -- so the sweep starts "
-        "at 2. Tells you how much of the signal is the daily cycle."),
+        "looks like today', lag=288 is 'the next 48h looks like the last 48h'. lag=1 is "
+        "textbook persistence and is UNSCOREABLE -- it emits a constant per turbine and "
+        "the official identical-prediction guard rejects it -- so the sweep starts at 2."),
     ("naive", "scale"): ("control", True, _SCALE),
 
     ("climatology", "n_days"): ("ablation", True,
@@ -607,12 +759,11 @@ AXIS_INFO = {
         "not a belief anyone holds."),
     ("climatology", "agg"): ("ablation", True,
         "Mean or median across days. SDWPF power is heavily zero-inflated, so a couple "
-        "of parked days drag a mean profile down and leave a median untouched. Tells "
-        "you how much curtailment distorts the profile."),
+        "of parked days drag a mean profile down and leave a median untouched."),
     ("climatology", "smooth"): ("tuning", False,
-        "Circular moving average over the finished 144-step profile, crossed with "
-        "n_days. Few days makes a noisy profile that the model then forecasts as if it "
-        "were structure; smoothing trades that noise for blur."),
+        "Circular moving average over the finished profile, crossed with n_days. Few "
+        "days makes a noisy profile that the model then forecasts as if it were "
+        "structure; smoothing trades that noise for blur."),
     ("climatology", "scale"): ("control", True, _SCALE),
 
     ("arma", "order"): ("ablation", True,
@@ -624,7 +775,7 @@ AXIS_INFO = {
         "are stable and the fit is cheap -- itself a useful finding. REFITS."),
     ("arma", "apply_steps"): ("tuning", True,
         "How much of a window's 14-day history is re-filtered to seed the forecast. No "
-        "refit; this is the model's main inference-speed lever."),
+        "refit; the model's main inference-speed lever."),
     ("arma", "scale"): ("control", True, _SCALE),
 
     ("gbdt", "seed"): ("noise", True,
@@ -637,12 +788,12 @@ AXIS_INFO = {
         "channels the model currently ignores (pitch angle says a turbine is feathered "
         "and will stay off). turbine->farm adds farm-wide state. farm->neighbour adds "
         "the k nearest turbines -- the real spatial signal. neighbour->xy adds raw "
-        "coordinates, which are a turbine IDENTIFIER: that gap estimates how much of "
-        "the score is turbine-specific rather than transferable. Report xy separately."),
+        "coordinates, which are a turbine IDENTIFIER: that gap estimates how much of the "
+        "score is turbine-specific rather than transferable. Report xy separately."),
     ("gbdt", "objective"): ("ablation", True,
         "Squared vs absolute error. The score is 0.5*(RMSE+MAE), so squared error "
-        "over-weights the tail and absolute under-weights it. Neither is right, which "
-        "is what makes the comparison worth running."),
+        "over-weights the tail and absolute under-weights it. Neither is right, which is "
+        "what makes the comparison worth running."),
     ("gbdt", "trees"): ("tuning", True, "Boosting rounds. Capacity."),
     ("gbdt", "depth"): ("tuning", True, "Tree depth. Capacity."),
     ("gbdt", "lr"): ("tuning", True, "Shrinkage per tree. Trades rounds against step size."),
@@ -656,41 +807,41 @@ AXIS_INFO = {
         "Neighbourhood size for the spatial tiers. Only meaningful if `features` shows "
         "neighbour helping at all."),
     ("gbdt", "combined"): ("tuning", False,
-        "One point combining the best guess from every axis. A coordinate sweep does "
-        "not license this extrapolation -- confirm it against the coordinate results "
-        "before believing it."),
+        "One point combining the best guess from every axis. A coordinate sweep does not "
+        "license this extrapolation -- confirm it against the coordinate results."),
     ("gbdt", "scale"): ("control", True, _SCALE),
 
-    ("gru", "seed"): ("noise", True,
-        "Five inference draws from the SAME checkpoints. The official predict.py never "
-        "calls model.eval(), so dropout is live at prediction time and forecast() is "
-        "stochastic. RUN THIS FIRST: until this spread is known, no other GRU row can "
-        "be read as a difference rather than as noise. Reuses existing checkpoints."),
-    ("gru", "train_loop"): ("ablation", True,
-        "Official loop vs corrected loop. The official has four real defects, faithfully "
-        "reproduced here: gradients are never zeroed (they accumulate across every batch "
-        "AND epoch), the optimizer is applied twice per batch, clipping is per-parameter "
-        "rather than global, and validation runs with dropout live so early stopping "
-        "reads noise. This axis measures what those cost. RETRAINS 134 models for the "
-        "fixed arm; the official arm reuses your existing checkpoints."),
-    ("gru", "infer_mode"): ("ablation", True,
-        "The same five draws with dropout switched off at inference. Separates 'the "
-        "model is noisy' from 'the model is wrong'. Reuses existing checkpoints."),
+    ("gru", "capacity"): ("tuning", True,
+        "Hidden size and layer count. The official 48 hidden units is 22,801 parameters "
+        "per turbine -- tiny -- and nothing is shared between the 134 models. RETRAINS."),
+    ("gru", "input_len"): ("tuning", True,
+        "How many history steps the model reads. The official 144 (24h) is used to "
+        "predict 288 (48h): the model forecasts two days from one. This is the most "
+        "suspicious default in the file and the axis most likely to move the score. "
+        "RETRAINS."),
+    ("gru", "optim"): ("tuning", True,
+        "Learning rate and its per-epoch decay, varied TOGETHER. The official 1e-4 "
+        "halving each epoch is ~1/500th of its starting value by epoch 10, so the model "
+        "may stop learning before it converges. A higher lr with fast decay is a "
+        "different experiment from a higher lr held flat. RETRAINS."),
+    ("gru", "budget"): ("tuning", True,
+        "Epochs and early-stopping patience, with the decay slowed so the extra epochs "
+        "can do something. Answers whether the model ever finished training. RETRAINS."),
+    ("gru", "batch"): ("tuning", False,
+        "Minibatch size. Interacts with the learning rate, so read it against the optim "
+        "axis rather than alone. RETRAINS."),
+    ("gru", "dropout"): ("tuning", False,
+        "Regularisation strength. 134 independent models, each fitted to one turbine's "
+        "data, is a regime where this might matter. RETRAINS."),
+    ("gru", "provenance"): ("ablation", True,
+        "The official Baidu loop with all four defects restored: gradients never zeroed, "
+        "two optimizer steps per batch, per-parameter clipping, dropout live at "
+        "validation AND inference, single-stream seeding. One point, kept so the report "
+        "can connect to the published 47.850. NOT a tuning point. RETRAINS, sequentially."),
+    ("gru", "combined"): ("tuning", False,
+        "Best guess from every axis at once. A coordinate sweep does not license this "
+        "extrapolation -- confirm it against the coordinate results. RETRAINS."),
     ("gru", "scale"): ("control", True, _SCALE),
-    ("gru", "clip"): ("tuning", False,
-        "Clamp negative predictions to zero. About a third of real SDWPF Patv readings "
-        "are negative -- idling turbines draw power -- so this is not obviously an "
-        "improvement. Reuses existing checkpoints."),
-    ("gru", "architecture"): ("tuning", False,
-        "input_len 288/432, hidden 96, one layer. The official reads 144 steps (24h) to "
-        "predict 288 (48h) with 48 hidden units: 22,801 parameters per turbine. The "
-        "input length is the more suspicious limit -- the model forecasts two days from "
-        "one. Run on the FIXED loop so capacity is not confounded with a broken "
-        "optimizer. RETRAINS, ~1 GPU-hour per point."),
-    ("gru", "optim"): ("tuning", False,
-        "lr=1e-3, and no LR decay over 20 epochs. The official runs 1e-4 halved every "
-        "epoch, so by epoch 10 the rate is ~1/500th of its start. Tests whether the "
-        "model ever finished training. RETRAINS, ~1 GPU-hour per point."),
 }
 
 
@@ -732,8 +883,8 @@ MODELS = {
         "path": "gru/gru_baseline.py",
         "grid": grid_gru,
         "prepare": prepare_gru,
-        "reference": "dropout-on seed=1",
-        "note": "inference axes ~1-3 min/point; the fixed-loop, architecture and optim points RETRAIN 134 models at ~1 GPU-hour each",
+        "reference": "hidden=48 layers=2 (default)",
+        "note": "every axis but scale RETRAINS 134 models: ~40 min sequential, ~7-10 min sharded across 4-6 --turbines processes",
     },
 }
 
@@ -838,7 +989,7 @@ def run(model, args):
     points.sort(key=lambda p: p["label"] != spec["reference"])
 
     os.makedirs(SWEEP_DIR, exist_ok=True)
-    cache_dir = os.path.join(SWEEP_DIR, "artefacts", model)
+    cache_dir = os.path.join(SWEEP_DIR, "artifacts", model)
     os.makedirs(cache_dir, exist_ok=True)
     tsv = args.out or os.path.join(SWEEP_DIR, "sweep_{}.tsv".format(model))
     status_path = os.path.splitext(tsv)[0] + ".status.json"

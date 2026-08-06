@@ -47,11 +47,11 @@ These are exactly the openings a better method exploits:
 
 ```bash
 # Run from the package root (windevolve_sdwpf/)
-python evaluator.py baseline_models/naive/baseline_naive.py
+python evaluation/evaluator.py baselines/naive/baseline_naive.py
 
 # Compare lags without editing the file
-SDWPF_NAIVE_LAG=144 python evaluator.py baseline_models/naive/baseline_naive.py
-SDWPF_NAIVE_LAG=288 python evaluator.py baseline_models/naive/baseline_naive.py
+SDWPF_NAIVE_LAG=144 python evaluation/evaluator.py baselines/naive/baseline_naive.py
+SDWPF_NAIVE_LAG=288 python evaluation/evaluator.py baselines/naive/baseline_naive.py
 ```
 
 ## Citation

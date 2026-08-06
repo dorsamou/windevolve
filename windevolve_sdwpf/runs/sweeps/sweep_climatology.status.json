@@ -1,0 +1,11 @@
+{
+  "model": "climatology",
+  "done": 25,
+  "total": 25,
+  "last_label": "n_days=14 scale=0.2",
+  "last_valid": true,
+  "last_score": 55.708406768925954,
+  "elapsed_seconds": 145.8,
+  "eta_seconds": 0.0,
+  "updated": "2026-08-05T19:47:54"
+}

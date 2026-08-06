@@ -36,6 +36,7 @@ import os                                    # checkpoint paths, env vars
 import sys                                   # package-root discovery
 import time                                  # timing
 import argparse                              # training CLI
+import random                                # seeding
 
 import numpy as np                           # array math
 import pandas as pd                          # CSV reading
@@ -74,6 +75,11 @@ CHECKPOINTS = os.environ.get("SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "check
 # forecasts are irreproducible run to run; set this to make a given run
 # repeatable while keeping the dropout noise that the official code has.
 INFER_SEED = os.environ.get("SDWPF_GRU_INFER_SEED")
+
+# Keep dropout ACTIVE at inference, as the official predict.py does. False (the
+# default) calls model.eval(), so forecast() is deterministic. Set True only to
+# reproduce the published baseline's stochastic behaviour.
+INFER_DROPOUT = os.environ.get("SDWPF_GRU_INFER_DROPOUT", "").lower() in ("1", "true", "yes")
 
 # Clip negative predictions to zero. False matches the official baseline.
 CLIP_NEGATIVE = False
@@ -122,33 +128,41 @@ def default_settings():
         "clip_norm": 50.0,        # gradient norm bound
 
         # ------------------------------------------------------------------
-        # DEVIATION SWITCHES. Every default below reproduces the official
-        # baseline's behaviour, INCLUDING its defects -- see gru_baseline.md
-        # section 6. They are settings rather than hardcoded so the cost of
-        # each defect can be measured instead of argued about. Flipping all
-        # four gives an ordinary, correct PyTorch training loop.
+        # TRAINING-LOOP CORRECTNESS. The official Baidu code has four real
+        # defects (gru_baseline.md section 6). This project's GRU is a
+        # comparator for the evolutionary search and a candidate seed program,
+        # not a reproduction of a published number -- so the defaults below are
+        # the CORRECT behaviour, and the official behaviour is opt-in via
+        # --official (or settings["official_loop"]).
         #
-        #   zero_grad   False = official. The official train.py never calls
-        #               clear_grad(), so the gradient buffer accumulates across
-        #               every batch AND every epoch. True restores the normal
-        #               optimizer.zero_grad() per step.
-        #   double_step True  = official. paddle's minimize(loss) already
-        #               updates, and the loop then calls step() as well, giving
-        #               two Adam applications per batch. False applies one.
-        #   global_clip False = official (paddle ClipGradByNorm bounds each
-        #               parameter tensor separately). True uses PyTorch's usual
-        #               global-norm rule.
-        #   eval_val    False = official (validation runs with dropout live, so
-        #               the early-stopping signal is noisy). True calls eval().
-        #   shuffle_val True  = official (the val loader shuffles with
-        #               drop_last, discarding a different random subset every
-        #               epoch). False measures the same windows each time.
+        #   zero_grad    True  = zero the gradient buffer each step. The
+        #                official train.py never calls clear_grad(), so its
+        #                gradients accumulate across every batch AND epoch --
+        #                by batch n the applied gradient is the sum of all n
+        #                preceding ones. This is the worst of the four.
+        #   double_step  False = one Adam application per batch. The official
+        #                gets two (paddle's minimize() updates, then step()).
+        #   global_clip  True  = clip the global gradient norm, PyTorch's usual
+        #                rule. The official clips each parameter separately.
+        #   eval_val     True  = dropout off while measuring validation loss,
+        #                so early stopping reads signal rather than noise.
+        #   shuffle_val  False = measure the same validation windows every
+        #                epoch. The official shuffles with drop_last, discarding
+        #                a different random subset each time.
+        #   per_turbine_seed True = seed from OFFICIAL_FIX_SEED + tid inside
+        #                each turbine. The official seeds ONCE before the loop,
+        #                which makes turbine 100's weights depend on turbines
+        #                0-99 having drawn first -- so a partial run is not
+        #                reproducible and turbines cannot be trained in
+        #                parallel. Per-turbine seeding fixes both, and is what
+        #                makes --turbines sharding valid.
         # ------------------------------------------------------------------
-        "zero_grad": False,
-        "double_step": True,
-        "global_clip": False,
-        "eval_val": False,
-        "shuffle_val": True,
+        "zero_grad": True,
+        "double_step": False,
+        "global_clip": True,
+        "eval_val": True,
+        "shuffle_val": False,
+        "per_turbine_seed": True,
     }
 
 
@@ -619,10 +633,20 @@ def train_one_turbine(data, tid, settings, device, ckpt_dir):
     Returns:
         The best validation loss as a float.
     """
-    # Deviation 7: NO per-turbine seeding. The official seeds once
-    # (fix_seed = 3407) before the turbine loop, so each turbine continues one
-    # RNG stream and its weights depend on the turbines before it having drawn
-    # first. main() does that seeding; re-seeding here would break the stream.
+    # Seed per turbine, so this turbine's result does not depend on which
+    # turbines ran before it. That makes a partial run reproducible and lets
+    # --turbines shards run in parallel -- the training loop is launch-bound
+    # rather than compute-bound, so sharding is close to a linear speedup.
+    # settings["per_turbine_seed"] = False restores the official single-stream
+    # seeding, in which case main() has already seeded and we must not re-seed.
+    if settings.get("per_turbine_seed", True):
+        seed = OFFICIAL_FIX_SEED + int(tid)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     train_ds, val_ds, scaler = build_turbine_splits(data, tid, settings)
     train_loader = DataLoader(train_ds, batch_size=settings["batch_size"],
                               shuffle=True, drop_last=True)
@@ -702,19 +726,20 @@ def _announce(partial_turbines):
     Returns:
         None
     """
-    print("[gru] official baseline: dropout is ACTIVE at inference (the official "
-          "predict.py never calls eval()), so forecast() is STOCHASTIC -- score "
-          "several times and report mean +/- std.", flush=True)
+    if INFER_DROPOUT:
+        print("[gru] dropout is ACTIVE at inference (official behaviour), so "
+              "forecast() is STOCHASTIC -- score several times and report "
+              "mean +/- std.", flush=True)
     if INFER_SEED is not None:
         print("[gru] inference seeded with SDWPF_GRU_INFER_SEED={}".format(INFER_SEED),
               flush=True)
     if partial_turbines:
-        print("[gru] WARNING: {} checkpoint(s) came from a PARTIAL training run "
-              "(e.g. turbine {}). The official baseline seeds once (fix_seed={}) "
-              "before a single pass over all 134 turbines, so a partial run does "
-              "not reproduce its RNG stream. Fine for a smoke test; do not report "
-              "the score.".format(len(partial_turbines), partial_turbines[0],
-                                  OFFICIAL_FIX_SEED), flush=True)
+        print("[gru] NOTE: {} checkpoint(s) came from a partial training run "
+              "(e.g. turbine {}). With per-turbine seeding this is reproducible "
+              "and shardable, so it is only a problem if the run is INCOMPLETE. "
+              "Under official single-stream seeding it would also fail to "
+              "reproduce the published RNG stream.".format(
+                  len(partial_turbines), partial_turbines[0]), flush=True)
 
 
 def _load_all(capacity):
@@ -744,11 +769,12 @@ def _load_all(capacity):
         settings = blob["settings"]
         model = BaselineGruModel(settings).to(device)
         model.load_state_dict(blob["state_dict"])
-        # Deviation 1: the official predict.py never calls model.eval(), and
-        # paddle Layers default to training=True, so the published 47.850 was
-        # produced with dropout ACTIVE at inference. Reproduced here, which is
-        # what makes forecast() stochastic.
-        model.train()
+        # The official predict.py never calls model.eval(), and paddle Layers
+        # default to training=True, so the published 47.850 was produced with
+        # dropout ACTIVE at inference -- which makes forecast() stochastic and
+        # every score a draw rather than a number. INFER_DROPOUT restores that
+        # for the provenance row; the default is a deterministic forecast.
+        model.train() if INFER_DROPOUT else model.eval()
         models.append(model)
         scalers.append((blob["scaler_mean"], blob["scaler_std"]))
         if not blob.get("full_run", True):
@@ -837,6 +863,8 @@ def main():
                         help="Inner-validation days used ONLY for early stopping. Must sum "
                              "with --train-days to the file's day count. Default: the "
                              "remainder (245-day file -> 31; 196-day file -> 25)")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Early-stopping patience in epochs (official: 3)")
     parser.add_argument("--input-len", type=int, default=None,
                         help="History steps fed to the GRU (official: 144 = 24h, to "
                              "predict 288 = 48h). Larger gives the model more context")
@@ -850,12 +878,12 @@ def main():
                         help="Adam learning rate (official: 1e-4)")
     parser.add_argument("--lr-decay", type=float, default=None,
                         help="Per-epoch LR multiplier (official: 0.5; 1.0 disables)")
-    parser.add_argument("--fixed-loop", action="store_true",
-                        help="Replace the official loop's four defects with correct "
-                             "behaviour: zero gradients each step, one optimizer step "
-                             "per batch, global-norm clipping, and dropout off during "
-                             "validation. This NO LONGER reproduces the published "
-                             "baseline -- report it as a separate model")
+    parser.add_argument("--official", action="store_true",
+                        help="Restore the official Baidu loop, defects and all: "
+                             "gradients never zeroed, two optimizer steps per batch, "
+                             "per-parameter clipping, dropout live during validation, "
+                             "and a single RNG stream seeded once before the turbine "
+                             "loop. Use only to reproduce the published 47.850")
     parser.add_argument("--device", type=str, default=None, help="cuda | mps | cpu (default: auto)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Retrain turbines whose checkpoints already exist")
@@ -867,47 +895,61 @@ def main():
     if args.batch_size is not None:
         settings["batch_size"] = args.batch_size
     for key, val in (("input_len", args.input_len), ("hidden", args.hidden),
+                     ("patience", args.patience),
                      ("lstm_layer", args.layers), ("dropout", args.dropout),
                      ("lr", args.lr), ("lr_decay", args.lr_decay)):
         if val is not None:
             settings[key] = val
-    if args.fixed_loop:
-        settings.update({"zero_grad": True, "double_step": False,
-                         "global_clip": True, "eval_val": True,
-                         "shuffle_val": False})
-        print("*** --fixed-loop: this is NOT the published baseline ***")
+    if args.official:
+        settings.update({"zero_grad": False, "double_step": True,
+                         "global_clip": False, "eval_val": False,
+                         "shuffle_val": True, "per_turbine_seed": False})
+        print("*** --official: reproducing the Baidu loop INCLUDING its four "
+              "known defects; train all 134 turbines in one pass or the RNG "
+              "stream will not match ***")
 
     device = pick_device(args.device)
     turbines = parse_turbines(args.turbines, settings["capacity"])
     full_run = (len(turbines) == settings["capacity"]) and not _has_checkpoints(args.checkpoints)
     settings["_full_run"] = full_run
 
-    # Deviation 7: the official seeds ONCE here, before the turbine loop, so
-    # every turbine continues one RNG stream and its weights depend on the
-    # turbines before it having drawn first.
-    import random                                   # the official seeds this too
-    random.seed(OFFICIAL_FIX_SEED)
-    np.random.seed(OFFICIAL_FIX_SEED)
-    torch.manual_seed(OFFICIAL_FIX_SEED)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(OFFICIAL_FIX_SEED)
+    # Under the default per-turbine seeding, train_one_turbine() seeds itself
+    # from OFFICIAL_FIX_SEED + tid, so this global seed is only needed for
+    # --official, which reproduces the single RNG stream the Baidu code uses.
+    if not settings.get("per_turbine_seed", True):
+        random.seed(OFFICIAL_FIX_SEED)
+        np.random.seed(OFFICIAL_FIX_SEED)
+        torch.manual_seed(OFFICIAL_FIX_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(OFFICIAL_FIX_SEED)
 
     print("device      : {}".format(device))
     print("turbines    : {} (n={})".format(
         "{}..{}".format(turbines[0], turbines[-1]) if turbines else "none", len(turbines)))
     print("checkpoints : {}".format(args.checkpoints))
-    print("seed        : {} (set once, before the turbine loop)".format(OFFICIAL_FIX_SEED))
+    per_turb = settings.get("per_turbine_seed", True)
+    print("seed        : {}{}".format(
+        OFFICIAL_FIX_SEED,
+        " + turbine id (per-turbine; shards are independent)" if per_turb
+        else " (set once before the turbine loop; official single stream)"))
     if not full_run:
         print("")
-        print("  *** PARTIAL RUN -- SMOKE TEST ONLY ***")
-        print("  The official baseline trains all {} turbines in a single pass from one".format(
-            settings["capacity"]))
-        print("  seed, so every turbine's weights depend on the ones before it. This run")
-        print("  covers {} turbine(s){} and therefore does NOT reproduce the official".format(
-            len(turbines), " and resumes an existing folder" if
-            _has_checkpoints(args.checkpoints) else ""))
-        print("  RNG stream. The checkpoints are stamped partial and scoring will warn.")
-        print("  For the real run: delete the checkpoint folder and pass no --turbines.")
+        if per_turb:
+            print("  Partial run: {} of {} turbines{}.".format(
+                len(turbines), settings["capacity"],
+                ", resuming an existing folder" if
+                _has_checkpoints(args.checkpoints) else ""))
+            print("  With per-turbine seeding this is reproducible and shardable --")
+            print("  each turbine seeds itself, so its weights do not depend on which")
+            print("  turbines ran before it. Only an INCOMPLETE set is a problem:")
+            print("  scoring needs all {} checkpoints present.".format(settings["capacity"]))
+        else:
+            print("  *** PARTIAL RUN UNDER --official -- SMOKE TEST ONLY ***")
+            print("  --official seeds once before the loop, so every turbine's weights")
+            print("  depend on the ones before it. This run covers {} turbine(s) and".format(
+                len(turbines)))
+            print("  therefore does NOT reproduce the official RNG stream. For the real")
+            print("  run: delete the checkpoint folder and pass no --turbines.")
         print("")
 
     print("loading training data ...")

@@ -12,7 +12,9 @@ A **per-turbine, non-seasonal ARIMA(p,d,q)** fitted once on the training series.
 - **I (d)** — difference the series `d` times to remove drift. Here **d = 0**: the ADF test (below) shows the series is already stationary, so no differencing is applied and the model works on the raw power. (When used, differencing is plain subtraction `y(t) − y(t−1)`, *not* a variance transform like box-cox; box-cox would need strictly positive values, which the zeros from parked turbines break.)
 - **MA (q)** — predict from a weighted sum of recent *errors*.
 
-Written ARIMA(p,d,q); here the default is **(1,0,1)** — an ARMA(1,1) model, since the ADF test shows no differencing is needed.
+Written ARIMA(p,d,q); the order this document recommends is **(1,0,1)** — an ARMA(1,1) model, since the ADF test shows no differencing is needed.
+
+> ⚠️ **The shipped code does not currently match this recommendation.** `baseline_arima.py` has `DEFAULT_ORDER = (1, 1, 1)`, and its inline comment justifies `d=1` from the slow ACF decay — the exact inference the ADF section below overrules. Until that is reconciled, pass `--order 1,0,1` explicitly to get the ARMA(1,1) model described here, or change `DEFAULT_ORDER` in the code.
 
 ## How the training data is preprocessed
 
@@ -20,9 +22,9 @@ The training path is deliberately light — much lighter than the test-scoring p
 
 1. **Reads only that turbine's rows and only the `Patv` column** (via `skiprows` and `usecols`), so the other 12 columns and other turbines are never loaded into memory.
 2. **Replaces NaN with 0** (`np.nan_to_num`) — parked or missing readings become zeros.
-3. **Keeps the trailing `FIT_STEPS`** (the last 245 days by default).
+3. **Keeps the trailing `FIT_STEPS`** — capped by the file's own length, so in practice the full 197 days of `val_train.csv`.
 
-That is the whole preprocessing. Note what it does *not* do: no masking, no kW→MW conversion, no splitting into per-turbine blocks. Those belong to the *evaluation* path (`evaluator.py` / `metrics.py`), which must reproduce the official score.
+That is the whole preprocessing. Note what it does *not* do: no masking, no kW→MW conversion, no splitting into per-turbine blocks. Those belong to the *evaluation* path (`evaluation/evaluator.py` / `evaluation/official_metrics.py`), which must reproduce the official score.
 
 ## The three diagnostic tests
 
@@ -68,27 +70,29 @@ The ADF test formally checks for **stationarity** — whether the series has a "
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `--order` | `1,0,1` | ARIMA (p,d,q), passed as `p,d,q` |
-| `--fit-days` | 245 | trailing training days used per turbine |
+| `--order` | `1,1,1` in code; **`1,0,1` recommended** — see the warning above | ARIMA (p,d,q), passed as `p,d,q` |
+| `--data` | `val_train.csv` | training CSV; the truncated file, not the 245-day one |
+| `--fit-days` | 245 | trailing training days requested per turbine |
 | `--model` | `arima_models.joblib` | output/input path for the fitted models |
 | `--turbines` | all | subset for quick tests, e.g. `0-9` |
 
 **Two history windows, used at different times:**
 
-- `FIT_STEPS` (`--fit-days` × 144) — history used **once, at fitting**, to estimate the coefficients. Defaults to the full **245 days**.
+- `FIT_STEPS` (`--fit-days` × 144) — history used **once, at fitting**, to estimate the coefficients. The constant asks for 245 days, but it is applied as a *trailing slice* of whatever `--data` holds, and `--data` defaults to `val_train.csv` (197 days). So the effective fit length is the full **197 days** of the truncated file, not 245. Fitting on the full 245-day file would leak the validation period into the coefficients.
 - `APPLY_STEPS` — history used **at inference, per window**, to seed the state before forecasting. Defaults to 3 days. Only the recent lags matter to a fitted ARMA(1,1), so this is a conservative warm-up, not information the forecast depends on in bulk.
 
 ## Usage
 
 ```bash
-# Fit one ARMA per turbine (writes arima_models.joblib)
-python baseline_models/classical/baseline_arima.py --turbines 0-133
+# Fit one ARMA(1,1) per turbine (writes arima_models.joblib beside the .py).
+# --order is given explicitly because DEFAULT_ORDER in the code is still (1,1,1).
+python baselines/classical/baseline_arima.py --turbines 0-133 --order 1,0,1
 
 # Score with the official metric
-python evaluator.py baseline_models/classical/baseline_arima.py
+python evaluation/evaluator.py baselines/classical/baseline_arima.py
 
 # Pass a different order on the command line (format: p,d,q)
-python baseline_models/classical/baseline_arima.py --order 2,0,1
+python baselines/classical/baseline_arima.py --order 2,0,1
 ```
 
 ### Saving and comparing multiple orders
@@ -97,13 +101,13 @@ python baseline_models/classical/baseline_arima.py --order 2,0,1
 
 ```bash
 # fit three orders to three files
-python baseline_models/classical/baseline_arima.py --order 1,0,1 --model arma_101.joblib
-python baseline_models/classical/baseline_arima.py --order 2,0,1 --model arma_201.joblib
-python baseline_models/classical/baseline_arima.py --order 1,1,1 --model arima_111.joblib
+python baselines/classical/baseline_arima.py --order 1,0,1 --model arma_101.joblib
+python baselines/classical/baseline_arima.py --order 2,0,1 --model arma_201.joblib
+python baselines/classical/baseline_arima.py --order 1,1,1 --model arima_111.joblib
 
 # score each by pointing the env var at its file
-SDWPF_ARIMA_MODEL=arma_101.joblib python evaluator.py baseline_models/classical/baseline_arima.py
-SDWPF_ARIMA_MODEL=arma_201.joblib python evaluator.py baseline_models/classical/baseline_arima.py
+SDWPF_ARIMA_MODEL=arma_101.joblib python evaluation/evaluator.py baselines/classical/baseline_arima.py
+SDWPF_ARIMA_MODEL=arma_201.joblib python evaluation/evaluator.py baselines/classical/baseline_arima.py
 ```
 
 Without `--model`, refitting overwrites the default `arima_models.joblib`.
