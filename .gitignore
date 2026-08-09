@@ -36,3 +36,4 @@ __pycache__/
 
 # karpathy workspace is its own git repo, pushed separately
 windevolve_sdwpf/arms/karpathy/workspace/
+windevolve_sdwpf/arms/karpathy/ws/

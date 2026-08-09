@@ -66,7 +66,11 @@ DEFAULT_TRAIN_CSV = VAL_TRAIN_FILE
 
 # The official global seed, set ONCE before the turbine loop
 # (common.py / train.py: fix_seed = 3407).
-OFFICIAL_FIX_SEED = 3407
+# Base training seed. The official value is 3407. Per-turbine seeding uses
+# OFFICIAL_FIX_SEED + tid, so changing this shifts every turbine's seed together
+# and gives an independent training run -- which is what a noise-floor
+# measurement needs. Override with SDWPF_GRU_SEED or --seed.
+OFFICIAL_FIX_SEED = int(os.environ.get("SDWPF_GRU_SEED", "3407"))
 
 # Folder holding model_0.pt ... model_133.pt (written by training, read by forecast).
 CHECKPOINTS = os.environ.get("SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "checkpoints"))
@@ -116,16 +120,50 @@ def default_settings():
         # after the first is read from the wrong offset and training silently
         # trains on another turbine's data. main() therefore overrides all three
         # from the file's actual length -- see resolve_day_sizes().
-        "lstm_layer": 2,          # GRU layers
-        "hidden": 48,             # GRU hidden size (official: 48)
+        "lstm_layer": 2,          # GRU layers (official: 2; 1 differs by 0.018 MW)
+        "hidden": 48,             # GRU hidden size (official: 48) -- see note below
         "dropout": 0.05,          # dropout before the projection
         "capacity": 134,          # turbines
-        "train_epochs": 10,       # max epochs per turbine
         "batch_size": 32,         # minibatch size
-        "patience": 3,            # early-stopping patience
-        "lr": 1e-4,               # Adam learning rate
-        "lr_decay": 0.5,          # per-epoch multiplier (official "type1")
         "clip_norm": 50.0,        # gradient norm bound
+        "lr": 1e-4,               # Adam learning rate (official: 1e-4)
+
+        # ------------------------------------------------------------------
+        # TRAINING BUDGET AND SCHEDULE. These three differ from the official
+        # values (10 epochs, patience 3, decay 0.5) and are the best MEASURED
+        # configuration on the 197/48 validation split, at 44.537 MW against
+        # 45.136 for the official settings. See docs/baseline_report.md 4.6.
+        #
+        # The official schedule was the binding constraint, not the learning
+        # rate or the architecture. lr=1e-4 halved every epoch is ~1/500th of
+        # its starting value by epoch 10, so the model stopped improving long
+        # before it converged:
+        #
+        #   lr=3e-4, decay 0.5          44.642
+        #   lr=1e-3, decay 0.5          44.667
+        #   lr=1e-4, NO decay           44.604   <- rate was never the problem
+        #   40 epochs, patience 8,
+        #     decay 0.9                 44.537   <- adopted
+        #
+        # Every optimiser variant gains ~0.5 MW over the official settings, and
+        # the best of them keeps the official learning rate and only relaxes the
+        # schedule.
+        # ------------------------------------------------------------------
+        "train_epochs": 40,       # max epochs per turbine (official: 10)
+        "patience": 8,            # early-stopping patience (official: 3)
+        "lr_decay": 0.9,          # per-epoch multiplier (official: 0.5)
+
+        # NOT ADOPTED, though it scored better in isolation: hidden=128 gave
+        # 44.745 against 45.136 for hidden=48, monotonic in 48 -> 96 -> 128 and
+        # still improving at the edge of the swept range. It was measured under
+        # the OFFICIAL optimiser schedule, so combining it with the budget above
+        # is an extrapolation no sweep point tested. Raising capacity and
+        # re-measuring is an open item; until then the default is the
+        # configuration that was actually scored at 44.537.
+        #
+        # Also measured and NOT adopted: input_len. 144 -> 288 -> 432 moves the
+        # score by 0.043 MW in total, the smallest effect in the entire study.
+        # Reading 24h to forecast 48h is not the binding constraint.
 
         # ------------------------------------------------------------------
         # TRAINING-LOOP CORRECTNESS. The official Baidu code has four real
@@ -863,6 +901,10 @@ def main():
                         help="Inner-validation days used ONLY for early stopping. Must sum "
                              "with --train-days to the file's day count. Default: the "
                              "remainder (245-day file -> 31; 196-day file -> 25)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base training seed (official: 3407). Per-turbine seeds "
+                             "are seed+tid, so changing this gives an independent "
+                             "training run -- use it to measure the noise floor")
     parser.add_argument("--patience", type=int, default=None,
                         help="Early-stopping patience in epochs (official: 3)")
     parser.add_argument("--input-len", type=int, default=None,
@@ -890,6 +932,20 @@ def main():
     args = parser.parse_args()
 
     settings = default_settings()
+
+    # --official first, as a base preset: it restores the whole official
+    # configuration (four loop defects, single-stream seeding, and the training
+    # budget/schedule, which now differ by default -- 40/8/0.9 vs 10/3/0.5).
+    # Explicit flags are applied AFTER it, so they still win.
+    if args.official:
+        settings.update({"zero_grad": False, "double_step": True,
+                         "global_clip": False, "eval_val": False,
+                         "shuffle_val": True, "per_turbine_seed": False,
+                         "train_epochs": 10, "patience": 3, "lr_decay": 0.5})
+        print("*** --official: reproducing the Baidu loop INCLUDING its four "
+              "known defects; train all 134 turbines in one pass or the RNG "
+              "stream will not match ***")
+
     if args.epochs is not None:
         settings["train_epochs"] = args.epochs
     if args.batch_size is not None:
@@ -900,13 +956,9 @@ def main():
                      ("lr", args.lr), ("lr_decay", args.lr_decay)):
         if val is not None:
             settings[key] = val
-    if args.official:
-        settings.update({"zero_grad": False, "double_step": True,
-                         "global_clip": False, "eval_val": False,
-                         "shuffle_val": True, "per_turbine_seed": False})
-        print("*** --official: reproducing the Baidu loop INCLUDING its four "
-              "known defects; train all 134 turbines in one pass or the RNG "
-              "stream will not match ***")
+    if args.seed is not None:
+        globals()["OFFICIAL_FIX_SEED"] = args.seed
+        print("base seed    : {} (non-default)".format(args.seed))
 
     device = pick_device(args.device)
     turbines = parse_turbines(args.turbines, settings["capacity"])

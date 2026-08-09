@@ -88,9 +88,57 @@ MODEL_PATH = os.environ.get("SDWPF_GBDT_MODEL", os.path.join(_HERE, "gbdt_model.
 # file would leak the validation period into the model.
 TRAIN_CSV = VAL_TRAIN_FILE
 
-# Which nested feature tier to use. "base" reproduces the original 12 features
-# exactly and is the reference configuration.
+# Which nested feature tier to use.
+#
+# MEASURED, against a noise floor of +/-0.396 MW:
+#
+#   power      9 feats  45.834      base minus wind speed
+#   base      12 feats  46.139  <-- DEFAULT
+#   turbine   22 feats  48.151      +2.01 MW WORSE, roughly 5 sigma
+#   farm      26 feats  47.582
+#   neighbour 29 feats  47.789
+#   xy        31 feats  47.609
+#
+# More information makes this model WORSE, not better. Three readings:
+#
+#   power -> base       wind speed at the origin buys nothing measurable. The
+#                       target is 48h out and nearly independent of present
+#                       wind; without a weather forecast there is little to use.
+#   base -> turbine     the largest single effect in the sweep, and negative.
+#                       These are origin-time snapshots held constant across all
+#                       288 horizons, so they let the model fit the origin state
+#                       when the distant target does not depend on it -- and
+#                       colsample_bytree dilutes the few useful columns among 22.
+#                       Consistent with every capacity axis saying "overfitting".
+#   neighbour -> xy     turbine coordinates uniquely identify a turbine, so this
+#                       is the strongest available invitation to memorise
+#                       per-turbine behaviour. It changes nothing, which is
+#                       evidence there is little turbine-specific structure to
+#                       exploit. Relevant to the project's generalisation
+#                       question; report it separately, never as "tuned XGBoost".
+#
+# The turbine tier may deserve a retest at the tuned capacity below, since the
+# penalty may reflect over-capacity rather than the features themselves.
 FEATURE_SET = os.environ.get("SDWPF_GBDT_FEATURES", "base")
+
+# ---------------------------------------------------------------------------
+# Model capacity. All three defaults come from the sweep on the 197/48
+# validation split; see docs/baseline_report.md section 4.5.
+#
+#   trees   200  45.445   400  46.139   800  46.683
+#   depth     4  45.512     6  46.139     9  47.180
+#   lr     0.03  45.759  0.05  46.139   0.1  47.231
+#
+# Every axis is monotonic toward a SMALLER model, each at 3-4 sigma of the
+# measured noise floor (+/-0.396 MW): this model overfits at the original
+# settings. CAVEAT: each optimum sits at the EDGE of the swept range, so the
+# true optimum is below these values and 45.445 is a lower bound rather than
+# this model's best. Extending the grid downward (trees 50/100, depth 2/3,
+# lr 0.01/0.02) is an open item.
+# ---------------------------------------------------------------------------
+N_ESTIMATORS = 200            # boosting rounds
+MAX_DEPTH = 4                 # maximum tree depth
+LEARNING_RATE = 0.03          # shrinkage applied to each tree's contribution
 
 # How many nearest turbines the "neighbour" tier aggregates over.
 K_NEIGHBOURS = int(os.environ.get("SDWPF_GBDT_K", "5"))
@@ -362,7 +410,7 @@ def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
 
 
 def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
-          model_path=None, n_estimators=400, max_depth=6, learning_rate=0.05,
+          model_path=None, n_estimators=None, max_depth=None, learning_rate=None,
           feature_set=None, k=None, subsample=0.8, colsample_bytree=0.8,
           min_child_weight=1, objective="reg:squarederror"):
     """
@@ -391,6 +439,9 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
     csv_path = csv_path or TRAIN_CSV
     model_path = model_path or MODEL_PATH
     fs = feature_set or FEATURE_SET
+    n_estimators = N_ESTIMATORS if n_estimators is None else n_estimators
+    max_depth = MAX_DEPTH if max_depth is None else max_depth
+    learning_rate = LEARNING_RATE if learning_rate is None else learning_rate
     names = feature_names(fs)
     print("building training set from", csv_path)
     print("  feature set: {} ({} features)".format(fs, len(names)))
@@ -493,9 +544,12 @@ def main():
                     help="Nearest turbines aggregated by the spatial tiers")
     ap.add_argument("--origins", type=int, default=150, help="Origins sampled per turbine")
     ap.add_argument("--stride", type=int, default=12, help="Horizon subsampling stride")
-    ap.add_argument("--trees", type=int, default=400, help="Number of boosting rounds")
-    ap.add_argument("--depth", type=int, default=6, help="Max tree depth")
-    ap.add_argument("--lr", type=float, default=0.05, help="Learning rate (shrinkage)")
+    ap.add_argument("--trees", type=int, default=N_ESTIMATORS,
+                    help="Number of boosting rounds (default: {})".format(N_ESTIMATORS))
+    ap.add_argument("--depth", type=int, default=MAX_DEPTH,
+                    help="Max tree depth (default: {})".format(MAX_DEPTH))
+    ap.add_argument("--lr", type=float, default=LEARNING_RATE,
+                    help="Learning rate / shrinkage (default: {})".format(LEARNING_RATE))
     ap.add_argument("--objective", type=str, default="reg:squarederror",
                     help="XGBoost loss (reg:squarederror | reg:absoluteerror)")
     ap.add_argument("--seed", type=int, default=42, help="RNG seed")

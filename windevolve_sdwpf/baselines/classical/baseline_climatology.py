@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-path: windevolve_sdwpf/baseline_models/classical/baseline_climatology.py
+path: windevolve_sdwpf/baselines/classical/baseline_climatology.py
 
 Description:
     Tier-1 statistical baseline: diurnal climatology. For each turbine it
@@ -14,6 +14,25 @@ Description:
     would emit a constant series. Averaging by time of day keeps the forecast
     varying across the horizon and therefore scoreable.
 
+    DEFAULT: N_DAYS = 10, the best setting on the 197/48 validation split
+    (47.047 MW, against 47.768 for all 14 days). Both memory parameters agree
+    that LONGER history is better: the score improves monotonically from 62.54
+    at 2 days to 47.05 at 10, and the exponential-weighting axis traces the same
+    curve. At a 48h horizon the recent weather regime carries no detectable
+    extra information -- the stable long-run daily shape is the signal.
+
+    Two caveats on the default. The 10-vs-14 margin is 0.72 MW, roughly 2x the
+    measured evaluation noise floor, and 10 was the best of seven points, so it
+    is better read as "10 and 14 are equivalent, everything shorter is worse"
+    than as a sharp optimum. And both curves were still improving at the edge of
+    the available history: this model only ever sees the window's own 14 days,
+    so 14 is a BOUND, not a measured optimum. Whether 30 days would help is
+    untestable without changing the model to read the training file.
+
+    N_DAYS = 1 is rejected outright by the zero-prediction guard, for the same
+    reason LAG = 144 is in the naive baseline: one day of history from a parked
+    turbine is all zeros. See docs/baseline_report.md section 4.3.
+
 Citation:
     Program contract and scoring follow the official Baidu KDD Cup 2022 SDWPF
     evaluator (PaddlePaddle/PaddleSpatial,
@@ -22,7 +41,8 @@ Citation:
              Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
 
 Example usage:
-    python evaluator.py baseline_models/classical/baseline_climatology.py
+    # Run from the package root (windevolve_sdwpf/):
+    python evaluation/evaluator.py baselines/classical/baseline_climatology.py
 """
 import numpy as np                # array reshaping and nan-aware means
 import pandas as pd               # read the infile CSV
@@ -32,17 +52,23 @@ OUTPUT_LEN = 288                  # forecast horizon in 10-min steps
 DAY_LEN = 144                     # steps per day (24h at 10-min resolution)
 
 # How many of the most recent history days enter the profile. None = all of
-# them, which is the original behaviour and stays the default. Fewer days makes
-# the profile more responsive to the current weather regime and noisier; more
-# days makes it a stabler long-run average. This is the model's only real
-# hyperparameter, so it is the axis analysis/sweep.py varies.
-N_DAYS = None
+# them (14). Fewer days makes the profile more responsive to the current weather
+# regime and noisier; more days makes it a stabler long-run average. 10 is the
+# best measured setting -- see the module docstring.
+N_DAYS = 10
 
 # How the days are combined at each time of day: "mean" (original) or "median".
 # SDWPF power is heavily zero-inflated -- curtailment, icing, maintenance -- so
 # a handful of parked days pull a mean profile down while leaving a median
-# profile untouched. Which is preferable is an empirical question, not an
-# obvious one, which is why it is swept rather than chosen here.
+# profile untouched.
+#
+# MEASURED: the median is WORSE by about 3 MW at every N_DAYS setting. The
+# mechanism above is real -- the mean IS biased low by parked days -- but the
+# metric rewards that bias. Half the score is MAE, MAE is minimised by the
+# conditional median of the target, and because power is zero-inflated that sits
+# well below the mean. A profile dragged down by parked days is accidentally
+# closer to what MAE wants; a median-over-days profile is higher in level and
+# moves away from it. Same phenomenon as the shrinkage result. Keep "mean".
 AGG = "mean"
 
 # Half-life, in days, of an exponential weighting over the history days: the

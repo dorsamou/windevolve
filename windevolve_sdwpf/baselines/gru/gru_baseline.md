@@ -360,3 +360,81 @@ identical inputs, larger than the whole spread of the baseline table), and the
 evaluation data may have moved between the validation tail and
 `final_phase_test`, which Section 7 warns are not comparable. The `provenance`
 point of `analysis/sweep.py` settles it: both loops, one split, one grader.
+
+---
+
+## 9. Measured results and the new defaults
+
+From the sweep on the 197/48 validation split (`docs/baseline_report.md` §4.6).
+Every axis except `scale` retrains all 134 models.
+
+| axis | setting | score (MW) |
+|---|---|---|
+| capacity | hidden=48, layers=2 (official) | 45.136 |
+| capacity | hidden=96 | 44.833 |
+| capacity | hidden=128 | **44.745** |
+| capacity | layers=1 | 45.118 |
+| input_len | 288 | 45.117 |
+| input_len | 432 | 45.093 |
+| optim | lr=3e-4 | 44.642 |
+| optim | lr=1e-3 | 44.667 |
+| optim | lr=1e-4, no decay | 44.604 |
+| optim | lr=1e-3, decay=0.9 | 44.778 |
+| budget | 20 epochs, patience 5 | 44.597 |
+| budget | **40 epochs, patience 8, decay 0.9** | **44.537** ← adopted |
+| provenance | official loop, all four defects | 44.802 |
+| scale | 0.8 | 44.643 |
+
+### The schedule was the binding constraint
+
+Every optimiser variant gains roughly 0.5 MW over the official settings, and the
+best of them — `lr=1e-4` with decay disabled — keeps the official *learning
+rate* and changes only the *schedule*. The official halves the rate every epoch,
+so by epoch 10 it is ~1/500th of its starting value. The budget axis confirms the
+diagnosis: 40 epochs with patience 8 gives the best GRU score in the study.
+**The model was stopping before it converged.**
+
+Defaults are now `train_epochs=40`, `patience=8`, `lr_decay=0.9` — exactly the
+configuration that scored 44.537, not a combination assembled from separate
+axes.
+
+### The defects were compensating for the schedule
+
+The official loop, with all four defects restored, scores **44.802 — better than
+the corrected loop at the official schedule (45.136)**. This is not an argument
+for the defects but an explanation of them: never zeroing gradients accumulates a
+running sum that behaves like momentum, and applying the optimiser twice per
+batch doubles the effective step size. Both compensate for a learning rate
+decaying to negligibility. Correcting the schedule honestly reaches 44.537,
+beating the defective loop by 0.27 MW.
+
+`--official` still reproduces the published configuration completely, and now
+also restores the original budget (10 epochs, patience 3, decay 0.5) since those
+differ from the defaults. Explicit CLI flags are applied after it and still win.
+
+### Measured and not adopted
+
+**`hidden=128` scored better in isolation** (44.745 vs 45.136), monotonic across
+48 → 96 → 128 and still improving at the edge of the swept range. It was measured
+under the *official* optimiser schedule, so combining it with the new budget is
+an extrapolation no sweep point tested. Raising capacity and re-measuring is an
+open item.
+
+**`input_len` does essentially nothing.** 144 → 288 → 432 moves the score by
+0.043 MW in total, the smallest effect measured anywhere in the study. Reading 24
+hours to forecast 48 was expected to be the dominant limitation and is not.
+
+### Caveat
+
+The GRU has **no measured noise floor**. Inference is deterministic under the
+corrected loop, but training is not, and the 0.598 MW gap between the official
+settings and the adopted ones is the same size as XGBoost's seed-to-seed spread
+(±0.396 MW). Differences between GRU configurations below roughly 0.5 MW should
+not be claimed.
+
+### Standing
+
+At **44.537 MW** this is second of five baselines, 0.21 MW behind ARMA. With
+XGBoost it brackets the project's structural question — 134 private models versus
+one shared model — and notably the private-models approach does not win, which is
+consistent with the null result from XGBoost's turbine-identity feature tier.

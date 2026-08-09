@@ -1,19 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-path: windevolve_sdwpf/baseline_models/classical/baseline_arima.py
+path: windevolve_sdwpf/baselines/classical/baseline_arima.py
 
 Description:
     Tier-1 fitted statistical baseline: a per-turbine, non-seasonal ARIMA.
+    134 independent models, one per turbine, each fitted to that turbine's Patv
+    series alone -- no wind speed, no time of day, no other turbines.
+
+    Training and prediction are separate. Coefficients are estimated once,
+    offline, on the truncated training file. At prediction time they are held
+    FIXED while the Kalman filter is re-run over the window's recent history to
+    establish the current state, and the forecast is projected OUTPUT_LEN steps.
+
+    DEFAULTS: order (1,0,1), fitted on the most recent 30 days. Both were chosen
+    by measurement on the 197/48 validation split; see docs/baseline_report.md
+    section 4.4. At 44.32 MW this is the best-scoring baseline in the suite --
+    better than a tuned GRU (44.54) and a tuned XGBoost (45.45), despite reading
+    one column where XGBoost reads nine.
 
 Example usage:
-    # fit and save three different orders to three files
-    python baseline_models/classical/baseline_arima.py --order 1,0,1 --model arma_101.joblib
-    python baseline_models/classical/baseline_arima.py --order 1,1,1 --model arima_111.joblib
-    python baseline_models/classical/baseline_arima.py --order 2,0,1 --model arma_201.joblib
+    # Run from the package root (windevolve_sdwpf/):
+    # fit and save different orders to different files
+    python baselines/classical/baseline_arima.py --order 1,0,1 --fit-days 30 --model arma_101.joblib
+    python baselines/classical/baseline_arima.py --order 1,1,1 --fit-days 30 --model arima_111.joblib
 
     # then score whichever you want by pointing the env var at it
-    SDWPF_ARIMA_MODEL=arma_101.joblib python evaluator.py baseline_models/classical/baseline_arima.py
-    SDWPF_ARIMA_MODEL=arima_111.joblib python evaluator.py baseline_models/classical/baseline_arima.py
+    SDWPF_ARIMA_MODEL=arma_101.joblib python evaluation/evaluator.py baselines/classical/baseline_arima.py
 """
 import os                                  # paths and env vars
 import sys                                 # package-root discovery
@@ -31,19 +43,40 @@ OUTPUT_LEN = 288              # forecast horizon in 10-min steps (48h)
 DAY_LEN = 144                 # steps per day
 START_COL = 3                 # first modeled column (Wspd); Patv is the target
 
-# ARIMA order (p, d, q). Chosen from the training ACF/PACF: the PACF shows a
-# single sharp spike at lag 1 then collapses into the noise band (the AR(1)
-# signature -> p=1); the ACF decays slowly and geometrically with no low-lag
-# cutoff and no bump at lag 144 (highly persistent -> d=1; no MA or seasonal
-# structure -> q small, non-seasonal). Override with --order on the CLI.
-DEFAULT_ORDER = (1, 1, 1)
+# ARIMA order (p, d, q). The PACF shows a single sharp spike at lag 1 then
+# collapses into the noise band -- the AR(1) signature, so p=1 -- with no MA or
+# seasonal structure, so q small and non-seasonal.
+#
+# d=0, NOT d=1. An earlier reading of the slowly-decaying ACF suggested the
+# series was highly persistent and wanted differencing. That was wrong, and both
+# an ADF test (unit root rejected decisively) and the sweep agree:
+#
+#     (1,0,1)  44.976        (1,1,1)  56.631      +11.66 MW, roughly 30 sigma
+#     (1,0,0)  45.063        (1,1,0)  REJECTED    92.54% turbines near-identical
+#
+# Wind power oscillates around a stable mean rather than trending, so
+# differencing OVER-differences it; what remains behaves like a random walk,
+# whose multi-step forecast is a flat line -- which is why (1,1,0) trips the
+# official identical-prediction guard outright.
+#
+# Order beyond (1,0,1) buys nothing: (2,0,2) scores 44.883, a 0.09 MW difference
+# well inside the evaluation noise floor. Override with --order on the CLI.
+DEFAULT_ORDER = (1, 0, 1)
 
 # Fit each turbine's model on the most recent FIT_STEPS of its training series.
-# The ACF/PACF show clean, stable AR(1) structure with no sign of regime change,
-# so more data gives tighter coefficient estimates at negligible cost for so
-# small a model -- fit on the full 245 days by default. Shorten with --fit-days
-# only if a turbine's dynamics are suspected to drift over the record.
-FIT_STEPS = 245 * DAY_LEN
+#
+# SHORTER IS BETTER, monotonically: 30 days 44.324, 90 days 44.681, 197 days
+# 44.976. The earlier assumption -- that stable AR(1) structure means more data
+# gives tighter estimates -- does not survive measurement. The dynamics drift
+# with season and weather regime, so old data is actively misleading rather than
+# merely redundant.
+#
+# Note this is the OPPOSITE of what climatology wants, where longer history wins
+# by 15 MW. The two models estimate different things: climatology estimates the
+# diurnal LEVEL profile, which is stable, while ARMA estimates the DYNAMICS,
+# which are not. Same data, opposite answers, and neither model alone would
+# reveal it.
+FIT_STEPS = 30 * DAY_LEN
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
@@ -61,10 +94,19 @@ TRAIN_CSV = VAL_TRAIN_FILE
 _CACHE = {"fits": None}       # module-level cache; forecast() runs 142 times
 
 # When applying a fitted model to a window, only the most recent APPLY_STEPS of
-# the 2016-step history are needed to seed the forecast. Re-filtering the full
-# 14 days is far slower for no benefit, since ARIMA state depends only on recent
-# lags. This is the main inference-speed lever.
-APPLY_STEPS = 3 * DAY_LEN     # 3 days of context to seed the forecast
+# the 2016-step history are re-filtered to seed the forecast.
+#
+# MEASURED: this has NO effect on the score at all. 144, 288, 432, 1008 and 2016
+# all return 44.9758 to four decimal places -- identical across a 14x range. The
+# exactness is the tell that it is structural: with coefficients frozen, a
+# STATIONARY ARMA's Kalman filter converges to steady state within a few dozen
+# steps and forgets its initial conditions, so earlier history cannot matter.
+# (A non-stationary model would not forget, which is a small extra confirmation
+# that d=0 is right.)
+#
+# Set to the shortest measured-equivalent value: one day. Purely an inference
+# speed lever -- raise it if a future change makes the state converge slower.
+APPLY_STEPS = 1 * DAY_LEN
 
 
 def _load_turbine_series(csv_path, tid, total, fit_steps):

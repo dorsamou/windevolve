@@ -33,7 +33,7 @@ So the model learns: "given the recent state, and that I am predicting *h* steps
 
 ## How the training data is built (step by step)
 
-The model learns from thousands of question-and-answer examples, all taken from the training CSV — which by default is `val_train.csv`, the file truncated to end before the validation period (days 1–197), **not** the full 245-day file. Fitting on the full file would train the model on its own validation targets. One example is:
+The model learns from thousands of question-and-answer examples, all taken from the 245-day training CSV. One example is:
 
 - **Question (features):** numbers describing "now" (the origin) plus how far ahead we are asking (the horizon `h`).
 - **Answer (target):** the actual power `h` steps after "now" — which we can simply look up, because it is historical data.
@@ -96,7 +96,7 @@ At forecast time the trees are fixed. For one input row, prediction is just the 
 prediction = P0 + lr · (T1(row) + T2(row) + ... + TN(row))
 ```
 
-For a full forecast, one turbine's `(288, n_features)` matrix (every horizon `h = 1..288`, no striding) is passed through all `N` trees at once, giving 288 power values. `n_features` depends on the feature tier the model was trained with — 12 for the default `base` tier, up to 31 for `xy`; see "Feature tiers" below. Repeat for 134 turbines, clip negatives to zero, and return `(134, 288, 1)`.
+For a full forecast, one turbine's `(288, 12)` feature matrix (every horizon `h = 1..288`, no striding) is passed through all `N` trees at once, giving 288 power values. Repeat for 134 turbines, clip negatives to zero, and return `(134, 288, 1)`.
 
 ## Features
 
@@ -133,14 +133,14 @@ Subsampling is necessary: 134 turbines × ~30,000 origins × 288 horizons is far
 ## Usage
 
 ```bash
-# Train the global model (writes gbdt_model.joblib beside the .py)
-python baselines/tree/baseline_gbdt.py --origins 150
+# Train the global model (writes gbdt_model.joblib)
+python baseline_models/tree/baseline_gbdt.py --origins 150
 
 # Score with the official metric
-python evaluation/evaluator.py baselines/tree/baseline_gbdt.py
+python evaluator.py baseline_models/tree/baseline_gbdt.py
 
 # A quicker, smaller model for testing
-python baselines/tree/baseline_gbdt.py --origins 50 --trees 100
+python baseline_models/tree/baseline_gbdt.py --origins 50 --trees 100
 ```
 
 ## Weaknesses
@@ -214,3 +214,95 @@ The saved `.joblib` now records `feature_set` and `k` alongside the model, and
 `forecast()` reads the tier **from the checkpoint** rather than from the module
 constant — so a model trained on one tier can never be scored with another
 tier's features.
+
+---
+
+## Measured results and the new defaults
+
+From the sweep on the 197/48 validation split (`docs/baseline_report.md` §4.5),
+against a measured evaluation noise floor of **±0.396 MW (1 sd)**.
+
+### Noise floor
+
+Three fits of an identical configuration, differing only in the RNG that samples
+forecast origins and builds trees:
+
+| seed | 42 | 43 | 44 | mean | 1 sd |
+|---|---|---|---|---|---|
+| score (MW) | 46.139 | 46.922 | 46.426 | 46.496 | **0.396** |
+
+A 0.78 MW spread between identical configurations. This is the yardstick for
+every other result here, and for the wider study.
+
+### Capacity — the model was overfitting
+
+| trees | 200 | 400 | 800 | | depth | 4 | 6 | 9 | | lr | 0.03 | 0.05 | 0.1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| score | **45.445** | 46.139 | 46.683 | | | **45.512** | 46.139 | 47.180 | | | **45.759** | 46.139 | 47.231 |
+
+All three axes monotonic toward a smaller model, each at 3–4σ. Defaults changed
+to `N_ESTIMATORS = 200`, `MAX_DEPTH = 4`, `LEARNING_RATE = 0.03`.
+
+**Caveat:** every optimum sits at the edge of the swept range, so the true
+optimum lies below these values and 45.445 is a *lower bound* on this model's
+performance rather than its best. Extending the grid downward (`trees` 50/100,
+`depth` 2/3, `lr` 0.01/0.02) is an open item.
+
+### Feature tiers — more information made it worse
+
+| tier | features | score | step | vs floor |
+|---|---|---|---|---|
+| power | 9 | **45.834** | — | |
+| **base** | **12** | **46.139** | +0.31 | within noise |
+| turbine | 22 | 48.151 | **+2.01** | ≈5σ |
+| farm | 26 | 47.582 | −0.57 | ≈1.4σ |
+| neighbour | 29 | 47.789 | +0.21 | within noise |
+| xy | 31 | 47.609 | −0.18 | within noise |
+
+`base` remains the default. Three readings:
+
+**Wind speed buys nothing** (`power → base`). The model sees wind speed at the
+forecast origin, and the target is 48 h later, essentially independent of it.
+Without a weather forecast there is little to extract — the no-future-weather
+constraint appearing as a feature ablation.
+
+**The auxiliary channels actively hurt** (`base → turbine`, +2.01 MW, the largest
+single effect in the sweep). Direction, temperatures, blade pitch, reactive power
+and the parked-fraction indicator are all origin-time snapshots held constant
+across all 288 horizons, so they let the model fit the origin state when the
+distant target does not depend on it; and `colsample_bytree` dilutes the few
+useful columns among 22. This is consistent with every capacity axis reporting
+overfitting. The hypothesis that pitch angle would identify parked turbines was
+reasonable and did not survive. Worth retesting at the tuned capacity before
+concluding the features themselves are worthless.
+
+**Neither spatial information nor turbine identity helps.** Farm aggregates and
+nearest-neighbour features both fall inside noise, so the physical story — upwind
+turbines observing weather before downwind ones — does not materialise at this
+horizon. More importantly, supplying each turbine's unique coordinates (`xy`)
+changes nothing: for a *global* model that is the strongest available invitation
+to memorise per-turbine behaviour. **There is little turbine-specific structure
+to exploit**, which bears directly on the project's generalisation question.
+Report `xy` separately; never fold it into "the tuned XGBoost".
+
+### Objective
+
+`reg:absoluteerror` scores 49.104 against 46.139 — 2.97 MW worse, degrading RMSE
+from 50.448 to 54.243 without improving MAE. Note this is the *opposite* of the
+`scale` control's effect, despite both moving predictions toward the median:
+shrinkage applies one global multiplier after fitting, whereas an absolute-error
+objective changes what every tree fits. The metric rewards the first and punishes
+the second. `reg:squarederror` remains the default.
+
+### Standing
+
+At **45.445 MW** this is third of five baselines, behind ARMA (44.324) and the
+GRU (44.537) — despite reading nine sensor channels those two do not. Its value
+in the suite is structural rather than competitive: as the only model shared
+across all 134 turbines, it is the closest analogue to an evolved
+single-function forecaster.
+
+In the regime analysis it is the best model at high power and short horizon
+(0.310 and 0.387 MW at 0–6 h), the only cells where a tree clearly wins, and the
+worst in the parked regime at short horizon. It is differently shaped rather than
+uniformly weaker.
