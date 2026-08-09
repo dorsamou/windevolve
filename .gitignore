@@ -1,27 +1,38 @@
+# ---- data ----
 wind_forecasting_data/
-openevolve-main/
 *.csv
 *.parquet
+*.tsv
 *.zip
+
+# ---- generated model artifacts (rebuild with data.py fit / train.py) ----
+fit_val/
+ckpt_val/
+checkpoints*
+npy/
+*/leaderboard/*/vendor/
+
+# ---- model binaries ----
+*.pt
+*.pth
+*.npy
+*.npz
+*.joblib
+
+# ---- outputs ----
+artifacts
+*.png
+COMPLETED
+
+# ---- logs ----
+logs
+karpathy_sdwpf/logs
+*.log
+
+# ---- python ----
 __pycache__/
 *.pyc
 .DS_Store
-PaddleSpatial-main
-SRIP Literature
-autoresearch_wpf
-checkpoints*
-*.joblib
-karpathy_sdwpf/logs
-*.log
-logs
-COMPLETED
-*/leaderboard/bigscity/vendor/
+
 # karpathy workspace is its own git repo, pushed separately
 windevolve_sdwpf/arms/karpathy/workspace/
-artifacts
-leaderboard/*/fit*/
-leaderboard/*/ckpt*/
-*.png
-*.tsv
-*.npy
-npy
