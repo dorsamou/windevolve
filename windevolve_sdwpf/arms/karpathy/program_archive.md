@@ -65,6 +65,11 @@ to the held-out validation windows.
   read-only and contains the scorer. Treat it as physics. `baselines/` is
   read-only and holds shared artifacts other runs depend on — never write
   there.
+- Run git anywhere except your own worktree. Your worktree is the only
+  repository you touch. Never `cd` to a parent directory and run git there,
+  never stage or commit outside your worktree, and never `git add` a path
+  beginning with `../`. If a command needs a directory change, use a subshell
+  that returns, and never combine `cd` with a git write.
 - Inspect other branches, other worktrees, or any other run's results. Several
   runs are executing concurrently from different starting models, and they must
   stay independent. Do not run `git log` or `git diff` against a branch other
