@@ -1,0 +1,78 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+
+    "additionalDirectories": [
+      "/home/dorsa/srip/windevolve_sdwpf"
+    ],
+
+    "allow": [
+      "Bash(python:*)",
+      "Bash(git:*)",
+      "Bash(grep:*)",
+      "Bash(tail:*)",
+      "Bash(head:*)",
+      "Bash(wc:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(cp:*)",
+      "Bash(mkdir:*)",
+      "Bash(printf:*)",
+      "Bash(echo:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(sort:*)",
+      "Bash(nvidia-smi:*)",
+
+      "Read(/home/dorsa/srip/windevolve_sdwpf/**)",
+
+      "Edit(/home/dorsa/srip/windevolve_sdwpf/arms/karpathy/ws/__SELF__/**)",
+      "Write(/home/dorsa/srip/windevolve_sdwpf/arms/karpathy/ws/__SELF__/**)"
+    ],
+
+    "deny": [
+      "Read(**/val_windows/outfile/**)",
+      "Read(**/final_phase_test/**)",
+      "Read(**/competition_score.py)",
+      "Read(**/sdwpf_245days_v1.csv)",
+
+      __PEER_DENIES__
+
+      "Edit(**/evaluation/**)",
+      "Write(**/evaluation/**)",
+      "Edit(**/baselines/**)",
+      "Write(**/baselines/**)",
+      "Edit(**/arms/openevolve/**)",
+      "Write(**/arms/openevolve/**)",
+      "Edit(**/analysis/**)",
+      "Write(**/analysis/**)",
+      "Edit(**/paths.py)",
+      "Write(**/paths.py)",
+
+      "Edit(**/program.md)",
+      "Write(**/program.md)",
+      "Edit(**/program_greedy.md)",
+      "Write(**/program_greedy.md)",
+      "Edit(**/program_archive.md)",
+      "Write(**/program_archive.md)",
+      "Edit(**/sample_parent.py)",
+      "Write(**/sample_parent.py)",
+      "Edit(**/checkpoints/**)",
+      "Write(**/checkpoints/**)",
+
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(chmod:*)",
+      "Bash(pip:*)",
+      "Bash(conda:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(sudo:*)",
+
+      "WebSearch",
+      "WebFetch"
+    ]
+  }
+}
