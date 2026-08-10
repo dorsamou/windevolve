@@ -8,6 +8,7 @@ wind_forecasting_data/
 # ---- generated model artifacts (rebuild with data.py fit / train.py) ----
 fit_val/
 ckpt_val/
+ckpt_full/
 checkpoints*
 npy/
 */leaderboard/*/vendor/
