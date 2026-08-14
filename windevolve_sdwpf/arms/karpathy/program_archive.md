@@ -24,10 +24,15 @@ starting from scratch and you should not create a branch. To set up:
      seeded with a working baseline model; read it in full before changing it.
    - `../../../../evaluation/evaluator.py` — how you are scored. Read it. Do
      not modify it, and do not follow its imports into the other scorer files.
-4. **Verify the split exists**: run `python ../../../../paths.py` and confirm
-   `VAL_DIR` and `VAL_TRAIN_FILE` both report `[ok]`. If either is MISSING,
-   stop and tell the human to generate the split first — you cannot score
-   anything without it.
+4. **Verify the fold layout exists**: confirm `$SDWPF_FOLDS_ROOT` is set and
+   contains `F1/` through `F5/`, each with a `fold_train.csv` and a `windows/`
+   directory. If it is missing or incomplete, stop and tell the human to
+   generate it first — you cannot score anything without it:
+
+   ```
+   echo $SDWPF_FOLDS_ROOT
+   ls $SDWPF_FOLDS_ROOT
+   ```
 5. **Confirm `results.tsv` exists** with just its header row. It has been
    created for you. Do not commit it.
 6. **Confirm and go**: report the seed model, the tag, and the budget.
@@ -44,16 +49,42 @@ Predict active power (`Patv`, in kW) for 134 wind turbines, 48 hours ahead at
 ```python
 def forecast(envs):
     """
-    envs: dict with "path_to_test_x" (path to an infile CSV containing 14 days
-          of history for all 134 turbines, stacked turbine-major), and
-          optionally "capacity" (134) and "output_len" (288).
+    envs: dict with
+      "path_to_test_x"  path to an infile CSV: 14 days of history for all 134
+                        turbines, stacked turbine-major
+      "path_to_train"   the training CSV for THIS FOLD. If you fit a model, fit
+                        it on this and nothing else. It changes between folds.
+      "fold"            the fold name, "F1".."F5". Use it to key any cached
+                        artefact you keep between calls.
+      optionally "capacity" (134) and "output_len" (288).
     returns: float array of shape (capacity, output_len, 1), predicted Patv in kW.
     """
 ```
 
 The evaluator calls this once per validation window, then scores the
-predictions using the same metric implementation the competition used, applied
-to the held-out validation windows.
+predictions using the same metric implementation the competition used.
+
+**Scoring is five-fold cross-validation.** Five folds, each with its own
+training period and its own 15 validation windows — 75 windows in total. Fold k
+trains only on days before its validation block, so nothing you fit can have
+seen the windows it is scored on:
+
+```
+F1   train days 1-95    validate 96-125
+F2   train days 1-125   validate 126-155
+F3   train days 1-155   validate 156-185
+F4   train days 1-185   validate 186-215
+F5   train days 1-215   validate 216-245
+```
+
+Your `competition_score` is the mean across the five folds. The evaluator also
+reports `fold_scores` and `fold_std` — both matter, see "Reading the fold
+breakdown" below.
+
+A single contiguous validation period was tried first and abandoned. It was a
+calmer, lower-wind stretch than the data as a whole, so programs tuned against
+it learned preferences that did not transfer. Five folds spanning different
+periods is the fix.
 
 **What you CAN do:**
 - Modify `forecaster.py`. Everything inside it is fair game: the forecasting
@@ -87,7 +118,7 @@ to the held-out validation windows.
 - Install new packages, or add dependencies. Use only what is already present
   in the environment. The exact package list is in `../../environment.txt`;
   check there before assuming something is available.
-- Read, open, or reference any file under `val_windows/outfile/`. Those are the
+- Read, open, or reference any file under any fold's `windows/outfile/`. Those are the
   ground-truth targets for the validation windows. Your program receives an
   infile path and must forecast from history alone. Reading the corresponding
   outfile — or deriving its path from the infile path — is not forecasting, and
@@ -95,10 +126,28 @@ to the held-out validation windows.
 - Read `competition_score.py`. It scores against the locked test set and
   contains nothing relevant to your task.
 
-**Training data**: if you fit a model, train it on `VAL_TRAIN_FILE` (the
-truncated CSV, days 1–197). Never on the full 245-day file — that contains the
-validation period you are scored on, and using it is leakage that makes your
-result meaningless. `paths.py` gives you the correct path.
+**Training data**: if you fit a model, train it on `envs["path_to_train"]` —
+that fold's own training CSV — and nothing else. Never on the full 245-day
+file, and never on a path you hardcode: both would include validation periods
+you are scored on, and that is leakage that makes the result meaningless.
+
+**Cached artefacts must be keyed by fold.** If you fit a model lazily and cache
+it, the cache key must include `envs["fold"]`. All five folds are scored in ONE
+process, so a cache that ignores the fold will serve fold 1's weights for every
+later fold — the numbers still print, and they are silently wrong:
+
+```python
+_CACHE = {}
+
+def _get_model(envs):
+    key = envs["fold"]                    # NOT a bare module-level global
+    if key not in _CACHE:
+        _CACHE[key] = _fit(envs["path_to_train"])
+    return _CACHE[key]
+```
+
+This has already produced one invalid result in this project. Treat it as a
+rule, not a suggestion.
 
 **Checkpoints**: your seed loads 134 per-turbine GRU checkpoints from
 `./checkpoints/`. That directory is the seed's and is IMMUTABLE — never write
@@ -130,7 +179,7 @@ forecasters must go through it, and must be logged as a row in `results.tsv`.
 
 Concretely, you may NOT:
 
-- carve your own train/validation split out of `VAL_TRAIN_FILE` and score
+- carve your own train/validation split out of any `fold_train.csv` and score
   candidates against it
 - write a scoring function — RMSE, MAE, the competition metric, or any proxy
   for forecast quality — and use it to compare candidates
@@ -176,9 +225,13 @@ baseline, so run the scorer on `forecaster.py` unmodified. This is evaluation
 ## Running an experiment
 
 ```
-python ../../../../evaluation/evaluator.py forecaster.py > run.log 2>&1
+python ../../../../evaluation/evaluator.py forecaster.py \
+    --folds-root $SDWPF_FOLDS_ROOT > run.log 2>&1
 cp run.log logs/<id>.log        # same <id> you will log in results.tsv
 ```
+
+`--folds-root` is what makes this five-fold. Without it you score a single old
+split and the number is not comparable to anything else in `results.tsv`.
 
 Redirect everything. Do NOT use `tee` or let output flood your context.
 
@@ -189,22 +242,56 @@ On success the scorer prints:
 ```
 program : forecaster.py
 metric  : OFFICIAL competition grader (kddcup22-sdwpf-evaluation, verbatim)
-val_dir : .../evaluation/splits/val_windows
+folds   : .../evaluation/splits_rolling_5x30
   combined_score: -46.732145
   competition_score: 46.732145
+  pct_capacity: 23.250
+  pct_capacity_std: 2.410
+  fold_std: 4.845
+  fold_worst: 51.203
+  n_folds: 5
+  fold_scores:
+    F1  49.881
+    F2  50.114
+    F3  42.377
+    F4  51.203
+    F5  40.086
   rmse: 52.104
   mae: 41.360
   latest_rmse: 48.221
-  n_windows: 24
-  eval_seconds: 31.4
+  n_windows: 75
+  eval_seconds: 96.4
   valid: True
 ```
 
 Extract what you need with:
 
 ```
-grep "competition_score:\|valid:\|eval_seconds:\|reason:" run.log
+grep "competition_score:\|fold_std:\|valid:\|eval_seconds:\|reason:" run.log
+sed -n '/fold_scores:/,/^  [a-z]/p' run.log     # the per-fold breakdown
 ```
+
+### Reading the fold breakdown
+
+`competition_score` is the mean over the five folds and is what you optimise.
+`fold_scores` and `fold_std` tell you something the mean cannot.
+
+Folds differ in intrinsic difficulty, and every forecaster finds the same folds
+hard — F5 is the easiest for all five baselines, F3 the second easiest. So a
+large `fold_std` is normal and is NOT evidence your program is unstable. On the
+baselines it runs 4.4 to 11.2 MW.
+
+What matters is how a change moves the folds RELATIVE to its parent:
+
+- lower on all five folds → a real improvement, keep it
+- lower on one or two and higher on the rest → probably noise, and the mean can
+  still come out lower. Be sceptical. Say so in the description.
+- much better on one fold only → usually means the change suits one period's
+  weather rather than forecasting better. That is the exact failure this
+  five-fold split exists to catch.
+
+A mean improvement smaller than about 1 MW is inside the noise of this split.
+Do not treat a 0.2 MW gain as established just because the number went down.
 
 **Important**: the evaluator never raises. A broken or rejected program returns
 `valid: False` with a `reason`, and a `combined_score` of about -1000000.
@@ -223,33 +310,44 @@ accurately would make the entire experiment worthless.
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT
 comma-separated — commas break in descriptions).
 
-The TSV has a header row and 6 columns:
+The TSV has a header row and 8 columns:
 
 ```
-id	parent_id	competition_score	eval_seconds	status	description
+id	parent_id	competition_score	fold_std	fold_scores	eval_seconds	status	description
 ```
 
 1. `id` — zero-padded 3-digit sequence number, starting at 001 for the seed
    baseline. This is also the name of the program's archive file.
 2. `parent_id` — the id of the program this one was edited from (`000` for the
    seed)
-3. `competition_score` in MW (e.g. 46.732145) — use 999.999999 for crashes and
-   for `valid: False`
-4. `eval_seconds`, rounded to .1f — use 0.0 for crashes
-5. status: see the loop section below for your arm's status values
-6. short text description of what this experiment tried
+3. `competition_score` in MW, the MEAN over the five folds (e.g. 46.732145) —
+   use 999.999999 for crashes and for `valid: False`
+4. `fold_std` in MW, to 6dp — use 999.999999 for crashes and invalids
+5. `fold_scores` — the five per-fold scores, comma-separated, in F1..F5 order,
+   each to 6dp. Use `-` for crashes and invalids. Never use tabs here.
+6. `eval_seconds`, rounded to .1f — use 0.0 for crashes
+7. status: see the loop section below for your arm's status values
+8. short text description of what this experiment tried
+
+Column 5 is the important addition. It is the only record of WHERE a program
+won or lost, and it cannot be recovered later — the mean alone cannot tell you
+whether a change helped everywhere or got lucky on one period.
 
 Example:
 
 ```
-id	parent_id	competition_score	eval_seconds	status	description
-001	000	44.537366	8.3	scored	seed baseline unmodified
-002	001	44.118203	9.1	scored	clip negative predictions to zero
-003	002	45.902118	8.8	scored	linear trend extrapolation on last 6h
-004	002	999.999999	2.2	invalid	per-turbine constant, rejected by output check
-005	002	999.999999	0.0	crash	nan in output, ValueError in reshape
-006	002	999.999999	0.0	retrain	refit with hidden=96 into .cache/ckpt_006/
+id	parent_id	competition_score	fold_std	fold_scores	eval_seconds	status	description
+001	000	44.537366	4.845102	49.881,50.114,42.377,51.203,40.086	96.4	scored	seed baseline unmodified
+002	001	44.118203	4.771044	49.402,49.688,41.905,50.744,39.612	98.1	scored	clip negatives to zero; lower on all five folds
+003	002	45.902118	6.113827	48.998,53.771,43.010,55.882,40.107	97.8	scored	trend extrapolation; better on F1 only, worse elsewhere
+004	002	999.999999	999.999999	-	2.2	invalid	per-turbine constant, rejected by output check
+005	002	999.999999	999.999999	-	0.0	crash	nan in output, ValueError in reshape
+006	002	999.999999	999.999999	-	0.0	retrain	refit with hidden=96 into .cache/ckpt_006/
 ```
+
+Row 003 is the pattern to watch for: the mean got worse, but even if it had not,
+winning on one fold while losing on three is a period-specific artefact rather
+than a forecasting gain. Note that in the description when you see it.
 
 Also append to `FAILURE_MODES.md` whenever something fails in a way that
 teaches you something — a check you did not anticipate, a constraint of the
@@ -277,9 +375,9 @@ LOOP until the budget is exhausted:
 3. Tune `forecaster.py` with an experimental idea by directly hacking the code
 4. `git commit`
 5. Run the experiment:
-   `python ../../../../evaluation/evaluator.py forecaster.py > run.log 2>&1`
+   `python ../../../../evaluation/evaluator.py forecaster.py --folds-root $SDWPF_FOLDS_ROOT > run.log 2>&1`
 6. Read out the results:
-   `grep "competition_score:\|valid:\|eval_seconds:\|reason:" run.log`
+   `grep "competition_score:\|fold_std:\|valid:\|eval_seconds:\|reason:" run.log`
 7. If the grep output is empty, the process died. Run `tail -n 50 run.log` to
    read the stack trace and attempt a fix. If you can't get it working after a
    few attempts, give up on that idea and move on.

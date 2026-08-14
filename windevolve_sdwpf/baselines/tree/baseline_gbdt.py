@@ -193,6 +193,31 @@ FEATURES = feature_names("base")
 
 _CACHE = {"model": None, "features": None, "feature_set": None, "k": K_NEIGHBOURS}
 
+def _resolve_path(envs, template):
+    """
+    Description:
+        Resolve a model/checkpoint path, substituting "{fold}" when the
+        evaluator supplies a fold name in envs. This is what lets ONE process
+        score every fold of a cross-validation layout: without it, the path is
+        fixed at import time and all five folds would silently load the same
+        artefact -- which is a leak, not a score.
+    Args:
+        envs: the settings dict passed to forecast() (may be None)
+        template: the configured path, optionally containing "{fold}"
+    Returns:
+        The resolved filesystem path.
+    """
+    if "{fold}" not in template:
+        return template
+    fold = (envs or {}).get("fold")
+    if not fold:
+        raise ValueError(
+            "path {!r} contains '{{fold}}' but the evaluator supplied no fold. "
+            "Use --folds-root, or set a path without the placeholder."
+            .format(template))
+    return template.format(fold=fold)
+
+
 
 # ---------------------------------------------------------------------------
 # Farm context: everything a feature might need, loaded once per CSV
@@ -471,7 +496,7 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
     return model
 
 
-def _load_model():
+def _load_model(envs=None):
     """
     Description:
         Load the fitted model once and cache it, together with the feature tier
@@ -482,13 +507,16 @@ def _load_model():
     Returns:
         The fitted XGBoost regressor.
     """
-    if _CACHE["model"] is None:
-        if not os.path.exists(MODEL_PATH):
+    path = _resolve_path(envs, MODEL_PATH)
+    if _CACHE["model"] is None or _CACHE.get("path") != path:
+        if not os.path.exists(path):
             raise FileNotFoundError(
                 "No trained model at {!r}. Train it first: "
-                "python baselines/tree/baseline_gbdt.py".format(MODEL_PATH))
-        blob = joblib.load(MODEL_PATH)
+                "python baselines/tree/baseline_gbdt.py".format(path))
+        print("[gbdt] loading model from: {}".format(path), flush=True)
+        blob = joblib.load(path)
         _CACHE["model"] = blob["model"]
+        _CACHE["path"] = path
         _CACHE["features"] = blob.get("features", FEATURES)
         _CACHE["feature_set"] = blob.get("feature_set", "base")
         _CACHE["k"] = blob.get("k", K_NEIGHBOURS)
@@ -510,7 +538,7 @@ def forecast(envs):
     """
     capacity = envs.get("capacity", CAPACITY)
     output_len = envs.get("output_len", OUTPUT_LEN)
-    model = _load_model()
+    model = _load_model(envs)
 
     df = pd.read_csv(envs["path_to_test_x"])
     ctx = build_context(df, capacity, _CACHE["feature_set"], _CACHE["k"],

@@ -1,0 +1,230 @@
+{
+  "source_csv": "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv",
+  "fold": "F1",
+  "n_turbines": 134,
+  "steps_per_turbine": 35280,
+  "steps_per_day": 144,
+  "input_len": 2016,
+  "output_len": 288,
+  "train_days": [
+    1,
+    95
+  ],
+  "val_days": [
+    96,
+    125
+  ],
+  "train_rows_per_turbine": 13680,
+  "windows": [
+    {
+      "index": 1,
+      "infile": "0001in.csv",
+      "outfile": "0001out.csv",
+      "history_steps": [
+        11664,
+        13680
+      ],
+      "target_steps": [
+        13680,
+        13968
+      ],
+      "target_day": 96
+    },
+    {
+      "index": 2,
+      "infile": "0002in.csv",
+      "outfile": "0002out.csv",
+      "history_steps": [
+        11952,
+        13968
+      ],
+      "target_steps": [
+        13968,
+        14256
+      ],
+      "target_day": 98
+    },
+    {
+      "index": 3,
+      "infile": "0003in.csv",
+      "outfile": "0003out.csv",
+      "history_steps": [
+        12240,
+        14256
+      ],
+      "target_steps": [
+        14256,
+        14544
+      ],
+      "target_day": 100
+    },
+    {
+      "index": 4,
+      "infile": "0004in.csv",
+      "outfile": "0004out.csv",
+      "history_steps": [
+        12528,
+        14544
+      ],
+      "target_steps": [
+        14544,
+        14832
+      ],
+      "target_day": 102
+    },
+    {
+      "index": 5,
+      "infile": "0005in.csv",
+      "outfile": "0005out.csv",
+      "history_steps": [
+        12816,
+        14832
+      ],
+      "target_steps": [
+        14832,
+        15120
+      ],
+      "target_day": 104
+    },
+    {
+      "index": 6,
+      "infile": "0006in.csv",
+      "outfile": "0006out.csv",
+      "history_steps": [
+        13104,
+        15120
+      ],
+      "target_steps": [
+        15120,
+        15408
+      ],
+      "target_day": 106
+    },
+    {
+      "index": 7,
+      "infile": "0007in.csv",
+      "outfile": "0007out.csv",
+      "history_steps": [
+        13392,
+        15408
+      ],
+      "target_steps": [
+        15408,
+        15696
+      ],
+      "target_day": 108
+    },
+    {
+      "index": 8,
+      "infile": "0008in.csv",
+      "outfile": "0008out.csv",
+      "history_steps": [
+        13680,
+        15696
+      ],
+      "target_steps": [
+        15696,
+        15984
+      ],
+      "target_day": 110
+    },
+    {
+      "index": 9,
+      "infile": "0009in.csv",
+      "outfile": "0009out.csv",
+      "history_steps": [
+        13968,
+        15984
+      ],
+      "target_steps": [
+        15984,
+        16272
+      ],
+      "target_day": 112
+    },
+    {
+      "index": 10,
+      "infile": "0010in.csv",
+      "outfile": "0010out.csv",
+      "history_steps": [
+        14256,
+        16272
+      ],
+      "target_steps": [
+        16272,
+        16560
+      ],
+      "target_day": 114
+    },
+    {
+      "index": 11,
+      "infile": "0011in.csv",
+      "outfile": "0011out.csv",
+      "history_steps": [
+        14544,
+        16560
+      ],
+      "target_steps": [
+        16560,
+        16848
+      ],
+      "target_day": 116
+    },
+    {
+      "index": 12,
+      "infile": "0012in.csv",
+      "outfile": "0012out.csv",
+      "history_steps": [
+        14832,
+        16848
+      ],
+      "target_steps": [
+        16848,
+        17136
+      ],
+      "target_day": 118
+    },
+    {
+      "index": 13,
+      "infile": "0013in.csv",
+      "outfile": "0013out.csv",
+      "history_steps": [
+        15120,
+        17136
+      ],
+      "target_steps": [
+        17136,
+        17424
+      ],
+      "target_day": 120
+    },
+    {
+      "index": 14,
+      "infile": "0014in.csv",
+      "outfile": "0014out.csv",
+      "history_steps": [
+        15408,
+        17424
+      ],
+      "target_steps": [
+        17424,
+        17712
+      ],
+      "target_day": 122
+    },
+    {
+      "index": 15,
+      "infile": "0015in.csv",
+      "outfile": "0015out.csv",
+      "history_steps": [
+        15696,
+        17712
+      ],
+      "target_steps": [
+        17712,
+        18000
+      ],
+      "target_day": 124
+    }
+  ]
+}

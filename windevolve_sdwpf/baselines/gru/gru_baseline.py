@@ -89,7 +89,33 @@ INFER_DROPOUT = os.environ.get("SDWPF_GRU_INFER_DROPOUT", "").lower() in ("1", "
 CLIP_NEGATIVE = False
 
 # Module-level cache: models load once and are reused across all 142 windows.
-_CACHE = {"models": None, "scalers": None, "settings": None, "device": None}
+_CACHE = {"models": None, "scalers": None, "settings": None,
+          "device": None, "path": None}
+
+def _resolve_path(envs, template):
+    """
+    Description:
+        Resolve a checkpoint directory, substituting "{fold}" when the evaluator
+        supplies a fold name in envs. This is what lets ONE process score every
+        fold of a cross-validation layout: without it the directory is fixed at
+        import time and all five folds would silently load the same weights --
+        which is a leak, not a score.
+    Args:
+        envs: the settings dict passed to forecast() (may be None)
+        template: the configured path, optionally containing "{fold}"
+    Returns:
+        The resolved filesystem path.
+    """
+    if "{fold}" not in template:
+        return template
+    fold = (envs or {}).get("fold")
+    if not fold:
+        raise ValueError(
+            "path {!r} contains '{{fold}}' but the evaluator supplied no fold. "
+            "Use --folds-root, or set a path without the placeholder."
+            .format(template))
+    return template.format(fold=fold)
+
 
 
 def default_settings():
@@ -780,25 +806,30 @@ def _announce(partial_turbines):
                   len(partial_turbines), partial_turbines[0]), flush=True)
 
 
-def _load_all(capacity):
+def _load_all(capacity, envs=None):
     """
     Description:
-        Load every turbine's checkpoint once and populate the module cache with
-        the models, their scaler statistics, and the training settings.
+        Load every turbine's checkpoint and populate the module cache with the
+        models, their scaler statistics, and the training settings. The cache is
+        keyed on the RESOLVED checkpoint directory, so scoring a second fold in
+        the same process reloads that fold's weights rather than serving the
+        previous fold's.
     Args:
         capacity: number of turbines expected (134)
+        envs: settings dict from forecast(); supplies "fold" when present
     Returns:
         None
     """
-    if _CACHE["models"] is not None:
+    ckpt_dir = _resolve_path(envs, CHECKPOINTS)
+    if _CACHE["models"] is not None and _CACHE["path"] == ckpt_dir:
         return
     device = pick_device()
     # Announce which checkpoint folder is being used, so the scorer's output
-    # makes the source unambiguous (e.g. checkpoints vs checkpoints_clip).
-    print("[gru] loading {} checkpoints from: {}".format(capacity, CHECKPOINTS), flush=True)
+    # makes the source unambiguous (e.g. ckpt_val vs ckpt_F3).
+    print("[gru] loading {} checkpoints from: {}".format(capacity, ckpt_dir), flush=True)
     models, scalers, settings, partial = [], [], None, []
     for tid in range(capacity):
-        path = os.path.join(CHECKPOINTS, "model_{}.pt".format(tid))
+        path = os.path.join(ckpt_dir, "model_{}.pt".format(tid))
         if not os.path.exists(path):
             raise FileNotFoundError(
                 "Missing checkpoint for turbine {} at {!r}. Train it first: "
@@ -818,7 +849,7 @@ def _load_all(capacity):
         if not blob.get("full_run", True):
             partial.append(tid)
     _CACHE.update({"models": models, "scalers": scalers,
-                   "settings": settings, "device": device})
+                   "settings": settings, "device": device, "path": ckpt_dir})
     _announce(partial)
 
 
@@ -835,7 +866,7 @@ def forecast(envs):
         A float array of shape (capacity, output_len, 1) with predicted Patv (kW).
     """
     capacity = envs.get("capacity", 134)
-    _load_all(capacity)
+    _load_all(capacity, envs)
     models, scalers = _CACHE["models"], _CACHE["scalers"]
     settings, device = _CACHE["settings"], _CACHE["device"]
     # In faithful mode dropout is live, so forecast() is stochastic. The

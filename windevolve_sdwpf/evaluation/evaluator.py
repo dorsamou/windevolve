@@ -75,6 +75,13 @@ MIN_DISTINCT_RATIO = float(os.environ.get("SDWPF_MIN_DISTINCT_RATIO", "0.1"))
 # candidate can never outrank a working one.
 PENALTY_COMBINED_SCORE = -1.0e6
 
+# Farm rated capacity in MW: 134 turbines x 1500 kW. The competition score is a
+# SUM of per-turbine errors in MW, so dividing by this gives error as a percent
+# of installed capacity -- the normalisation the wind-forecasting literature
+# uses (nMAE/nRMSE), and the one that stays comparable across periods because
+# capacity is fixed while mean wind is not.
+FARM_CAPACITY_MW = 134 * 1.5
+
 # Soft budget warning: OpenEvolve kills candidates that exceed its per-eval
 # timeout, and a killed eval collapses to fitness 0.0 -- which would OUTRANK
 # valid negative scores. Warn if we get close.
@@ -100,11 +107,18 @@ def _load_program(path):
     return module
 
 
-def _prep_env(path_to_test_x=None):
-    """Build the envs dict for forecast(). Fitters must use the TRUNCATED csv."""
+def _prep_env(path_to_test_x=None, train_file=None, fold=None):
+    """Build the envs dict for forecast(). Fitters must use the TRUNCATED csv.
+
+    train_file overrides VAL_TRAIN_FILE so each fold fits on its own prefix.
+    fold is the fold name ("F1".."F5"), or None on the single split. Programs
+    that persist fitted artefacts resolve them per fold from this, so one
+    process can score five folds without reloading the wrong weights.
+    """
     return {
         "path_to_test_x": path_to_test_x,
-        "path_to_train": VAL_TRAIN_FILE,
+        "path_to_train": train_file or VAL_TRAIN_FILE,
+        "fold": fold,
         "path_to_locations": LOCATION_FILE,
         "start_col": START_COL,
         "out_var": OUT_VAR,
@@ -146,7 +160,7 @@ def _penalty(reason, n_windows=None):
     return out
 
 
-def _score_forecaster(module, val_dir, n_windows=None):
+def _score_forecaster(module, val_dir, train_file=None, fold=None, n_windows=None):
     """
     Description:
         Score a loaded candidate on the validation windows through the OFFICIAL
@@ -155,10 +169,12 @@ def _score_forecaster(module, val_dir, n_windows=None):
     Args:
         module: loaded candidate exposing forecast(envs)
         val_dir: folder with infile/ and outfile/ validation windows
+        train_file: fold_train.csv for this fold (None = the global VAL_TRAIN_FILE)
+        fold: fold name passed through to forecast() as envs["fold"]
         n_windows: optional cap (None = all)
     Returns:
         A metrics dict with combined_score, competition_score, rmse, mae,
-        latest_rmse, n_windows, eval_seconds, valid.
+        latest_rmse, window_scores, n_windows, eval_seconds, valid.
     """
     infiles, outfiles = _list_windows(val_dir)
     n = len(infiles) if n_windows is None else min(n_windows, len(infiles))
@@ -172,7 +188,7 @@ def _score_forecaster(module, val_dir, n_windows=None):
                 "exceeded {:.0f}s after {}/{} windows".format(
                     EVAL_BUDGET_SECONDS, w, n))
         infile = infiles[w]
-        pred = np.asarray(module.forecast(_prep_env(infile)))       # (134, 288, 1)
+        pred = np.asarray(module.forecast(_prep_env(infile, train_file, fold)))  # (134,288,1)
 
         td = TestData(path_to_data=outfiles[w], start_col=START_COL, farm_capacity=CAPACITY)
         turbines, raw_turbines = td.get_all_turbines()
@@ -209,6 +225,12 @@ def _score_forecaster(module, val_dir, n_windows=None):
         "rmse": avg_rmse,
         "mae": avg_mae,
         "latest_rmse": float(np.mean(lrmses)),
+        # Per-window scores, same order as the window files. Already computed
+        # above -- previously averaged away. Paired comparisons between two
+        # candidates need these; comparing aggregate means does not cancel
+        # window difficulty and overstates the comparison noise several-fold.
+        "window_scores": [0.5 * (m + r) for m, r in zip(maes, rmses)],
+        "pct_capacity": round(100.0 * score / FARM_CAPACITY_MW, 3),
         "n_windows": n,
         "eval_seconds": round(elapsed, 2),
         "valid": True,
@@ -253,20 +275,178 @@ def evaluate(program_path, val_dir=None, n_windows=None):
         return _penalty("runtime error: {}".format(e))
 
 
+def _list_folds(folds_root):
+    """Discover fold directories written by `val_windows.py --layout rolling`."""
+    dirs = sorted(d for d in glob.glob(os.path.join(folds_root, "F*"))
+                  if os.path.isdir(os.path.join(d, "windows")))
+    if not dirs:
+        raise ValueError(
+            "No folds under {!r}. Build them first: python val_windows.py "
+            "--layout rolling --out-dir {}".format(folds_root, folds_root))
+    return dirs
+
+
+def evaluate_folds(program_path, folds_root=None, n_windows=None):
+    """
+    Description:
+        Score a candidate across every fold of a rolling-origin layout, each
+        fold fitting on its own fold_train.csv, and report the mean. Like
+        evaluate(), this NEVER raises -- any failure collapses to the penalty.
+
+        A candidate that fails on ANY fold is penalised outright rather than
+        scored on the folds that happened to work. Scoring the survivors would
+        silently change the number of folds behind a score and make candidates
+        incomparable, which is the same class of bug as the official grader's
+        variable turbine count.
+    Args:
+        program_path: candidate to score
+        folds_root: directory containing F1/, F2/, ... (default SDWPF_FOLDS_ROOT)
+        n_windows: optional per-fold cap on windows scored (None = all)
+    Returns:
+        A metrics dict. combined_score is what OpenEvolve maximizes; fold_scores
+        and window_scores carry the extra information folds make available.
+    """
+    root = folds_root if folds_root is not None else os.environ.get("SDWPF_FOLDS_ROOT")
+    if not root:
+        return _penalty("no folds_root given and SDWPF_FOLDS_ROOT is unset")
+    if n_windows is None:
+        n_windows = int(os.environ.get("SDWPF_MAX_WINDOWS", "0")) or None
+
+    try:
+        fold_dirs = _list_folds(root)
+    except Exception as e:
+        return _penalty("fold discovery failed: {}".format(e))
+
+    try:
+        module = _load_program(program_path)
+    except Exception as e:
+        return _penalty("import error: {}".format(e))
+    if not hasattr(module, "forecast"):
+        return _penalty("program exposes no forecast(envs)")
+
+    fold_scores, window_scores = {}, []
+    rmses, maes, lrmses, seconds = [], [], [], 0.0
+
+    for fdir in fold_dirs:
+        fname = os.path.basename(fdir)
+        try:
+            r = _score_forecaster(
+                module,
+                os.path.join(fdir, "windows"),
+                train_file=os.path.join(fdir, "fold_train.csv"),
+                fold=fname,
+                n_windows=n_windows)
+        except EvalBudgetExceeded as e:
+            return _penalty("{}: eval budget exceeded: {}".format(fname, e))
+        except om.MetricsError as e:
+            return _penalty("{}: degenerate prediction: {}".format(fname, e))
+        except Exception as e:
+            return _penalty("{}: runtime error: {}".format(fname, e))
+
+        fold_scores[fname] = r["competition_score"]
+        window_scores.extend(r["window_scores"])
+        rmses.append(r["rmse"]); maes.append(r["mae"]); lrmses.append(r["latest_rmse"])
+        seconds += r["eval_seconds"]
+
+    # Mean over FOLDS, not over windows: folds differ in window count, and a
+    # fold-weighted mean keeps every period contributing equally.
+    scores = list(fold_scores.values())
+    score = float(np.mean(scores))
+
+    return {
+        "combined_score": -score,               # OpenEvolve MAXIMIZES -> negate
+        "competition_score": score,
+        "rmse": float(np.mean(rmses)),
+        "mae": float(np.mean(maes)),
+        "latest_rmse": float(np.mean(lrmses)),
+        "fold_scores": fold_scores,             # per-period breakdown
+        "fold_std": float(np.std(scores)),      # this IS sigma_period
+        "pct_capacity": round(100.0 * score / FARM_CAPACITY_MW, 3),
+        "pct_capacity_std": round(100.0 * float(np.std(scores)) / FARM_CAPACITY_MW, 3),
+        "fold_worst": max(scores),
+        "window_scores": window_scores,         # for paired acceptance
+        "n_folds": len(fold_scores),
+        "n_windows": len(window_scores),
+        "eval_seconds": round(seconds, 2),
+        "valid": True,
+    }
+
+
+def accept_paired(cand_windows, parent_windows, k=1.0, block=3, n_boot=2000, seed=0):
+    """
+    Description:
+        Noise-aware acceptance test for the evolve loop. Accepts a candidate
+        only when it beats its parent by more than the noise in THAT COMPARISON.
+
+        Both programs are scored on the same windows, so a window that is hard
+        for everyone contributes nothing to distinguishing them -- it cancels in
+        the difference. Testing the paired difference, rather than comparing two
+        aggregate means, is what makes the threshold meaningful.
+    Args:
+        cand_windows / parent_windows: per-window score vectors (lower better)
+        k: threshold in standard errors. 1.0 permissive, 2.0 ~ 95% one-sided
+        block: moving-block length, to respect correlation between nearby windows
+    Returns:
+        (accept: bool, mean_delta: float, se: float) -- mean_delta negative =
+        candidate better. Log all three; the rejected ones are the interesting data.
+    """
+    d = np.asarray(cand_windows, dtype=float) - np.asarray(parent_windows, dtype=float)
+    d = d[~np.isnan(d)]
+    if d.size == 0:
+        return False, float("nan"), float("nan")
+    mean_d = float(d.mean())
+    if d.size < block + 1:
+        return bool(mean_d < 0), mean_d, float("nan")
+
+    rng = np.random.default_rng(seed)
+    blocks = np.array([d[i:i + block] for i in range(d.size - block + 1)])
+    nb = int(np.ceil(d.size / float(block)))
+    se = float(np.array([
+        np.concatenate(blocks[rng.integers(0, len(blocks), nb)])[:d.size].mean()
+        for _ in range(n_boot)]).std())
+    return bool(mean_d < 0 and abs(mean_d) > k * se), mean_d, se
+
+
 def main():
-    """CLI: score one program on the validation split and print the result."""
-    if len(sys.argv) < 2:
-        print("usage: python evaluator.py <program.py>")
+    """CLI: score one program on the validation split (or a fold layout)."""
+    argv = [a for a in sys.argv[1:]]
+    folds_root = None
+    if "--folds-root" in argv:
+        i = argv.index("--folds-root")
+        try:
+            folds_root = argv[i + 1]
+        except IndexError:
+            print("--folds-root needs a directory")
+            sys.exit(1)
+        del argv[i:i + 2]
+    elif os.environ.get("SDWPF_FOLDS_ROOT"):
+        folds_root = os.environ["SDWPF_FOLDS_ROOT"]
+
+    if not argv:
+        print("usage: python evaluator.py <program.py> [--folds-root <dir>]")
         sys.exit(1)
+
     n_cap = int(os.environ.get("SDWPF_MAX_WINDOWS", "0")) or None
-    print("program : {}".format(sys.argv[1]))
+    print("program : {}".format(argv[0]))
     print("metric  : OFFICIAL competition grader (kddcup22-sdwpf-evaluation, verbatim)")
-    print("val_dir : {}".format(VAL_DIR))
-    res = evaluate(sys.argv[1], n_windows=n_cap)
-    for k in ("combined_score", "competition_score", "rmse", "mae",
-              "latest_rmse", "n_windows", "eval_seconds", "valid", "reason"):
+
+    if folds_root:
+        print("folds   : {}".format(folds_root))
+        res = evaluate_folds(argv[0], folds_root=folds_root, n_windows=n_cap)
+    else:
+        print("val_dir : {}".format(VAL_DIR))
+        res = evaluate(argv[0], n_windows=n_cap)
+
+    for k in ("combined_score", "competition_score", "pct_capacity",
+              "pct_capacity_std", "rmse", "mae", "latest_rmse",
+              "fold_std", "fold_worst", "n_folds", "n_windows", "eval_seconds",
+              "valid", "reason"):
         if k in res:
             print("  {}: {}".format(k, res[k]))
+    if res.get("fold_scores"):
+        print("  fold_scores:")
+        for name, sc in res["fold_scores"].items():
+            print("    {:<6} {:.4f}".format(name, sc))
 
 
 if __name__ == "__main__":

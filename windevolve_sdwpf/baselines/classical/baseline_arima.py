@@ -91,7 +91,32 @@ MODEL_PATH = os.environ.get("SDWPF_ARIMA_MODEL", os.path.join(_HERE, "arima_mode
 # file would leak the validation period into the model.
 TRAIN_CSV = VAL_TRAIN_FILE
 
-_CACHE = {"fits": None}       # module-level cache; forecast() runs 142 times
+_CACHE = {"fits": None, "path": None}   # cache; forecast() runs many times
+
+def _resolve_path(envs, template):
+    """
+    Description:
+        Resolve a model/checkpoint path, substituting "{fold}" when the
+        evaluator supplies a fold name in envs. This is what lets ONE process
+        score every fold of a cross-validation layout: without it, the path is
+        fixed at import time and all five folds would silently load the same
+        artefact -- which is a leak, not a score.
+    Args:
+        envs: the settings dict passed to forecast() (may be None)
+        template: the configured path, optionally containing "{fold}"
+    Returns:
+        The resolved filesystem path.
+    """
+    if "{fold}" not in template:
+        return template
+    fold = (envs or {}).get("fold")
+    if not fold:
+        raise ValueError(
+            "path {!r} contains '{{fold}}' but the evaluator supplied no fold. "
+            "Use --folds-root, or set a path without the placeholder."
+            .format(template))
+    return template.format(fold=fold)
+
 
 # When applying a fitted model to a window, only the most recent APPLY_STEPS of
 # the 2016-step history are re-filtered to seed the forecast.
@@ -171,21 +196,26 @@ def fit_all(csv_path=None, turbines=None, order=DEFAULT_ORDER,
     return fits
 
 
-def _load_fits():
+def _load_fits(envs=None):
     """
     Description:
-        Load the fitted per-turbine models once and cache them.
+        Load the fitted per-turbine models and cache them. The cache is keyed on
+        the RESOLVED path, so switching folds mid-process reloads correctly
+        instead of serving stale fits.
     Args:
-        None
+        envs: settings dict from forecast(); supplies "fold" when present
     Returns:
         A dict {tid: fitted_results}.
     """
-    if _CACHE["fits"] is None:
-        if not os.path.exists(MODEL_PATH):
+    path = _resolve_path(envs, MODEL_PATH)
+    if _CACHE["fits"] is None or _CACHE["path"] != path:
+        if not os.path.exists(path):
             raise FileNotFoundError(
                 "No fitted models at {!r}. Fit them first: "
-                "python baseline_models/classical/baseline_arima.py".format(MODEL_PATH))
-        _CACHE["fits"] = joblib.load(MODEL_PATH)["fits"]
+                "python baselines/classical/baseline_arima.py".format(path))
+        print("[arma] loading fits from: {}".format(path), flush=True)
+        _CACHE["fits"] = joblib.load(path)["fits"]
+        _CACHE["path"] = path
     return _CACHE["fits"]
 
 
@@ -203,7 +233,7 @@ def forecast(envs):
     """
     capacity = envs.get("capacity", CAPACITY)
     output_len = envs.get("output_len", OUTPUT_LEN)
-    fits = _load_fits()
+    fits = _load_fits(envs)
 
     df = pd.read_csv(envs["path_to_test_x"])
     total = len(df) // capacity
