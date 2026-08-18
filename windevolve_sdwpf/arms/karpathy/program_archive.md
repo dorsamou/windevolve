@@ -149,27 +149,45 @@ def _get_model(envs):
 This has already produced one invalid result in this project. Treat it as a
 rule, not a suggestion.
 
-**Checkpoints**: your seed loads 134 per-turbine GRU checkpoints from
-`./checkpoints/`. That directory is the seed's and is IMMUTABLE — never write
-to it, never delete from it, never train into it.
+**Checkpoints are per fold.** Your seed loads 134 per-turbine GRU checkpoints,
+and there is a separate set for every fold, because fold k's weights may only
+have seen days before fold k's validation block. The path in `forecaster.py`
+contains a `{fold}` placeholder that the loader substitutes at scoring time:
 
-You may retrain. Retraining all 134 turbines takes about an hour, so treat it
-as a deliberate, expensive move rather than a routine step. Two hard rules:
+```python
+CHECKPOINTS = os.environ.get(
+    "SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "checkpoints", "{fold}"))
+```
 
-1. **Retrain into a versioned directory.** Use `.cache/ckpt_<id>/`, where
-   `<id>` is the id you will log for that experiment. Then set the checkpoint
-   path INSIDE `forecaster.py` to that literal directory, so the code and the
-   weights it depends on travel together. A program whose code says
-   `.cache/ckpt_014/` must keep behaving identically if it is re-run later.
-   Never point a program at a directory that a subsequent retrain will
-   overwrite.
-2. **Retraining is capped at 15 times.** Count your `retrain` rows in
+`./checkpoints/` is the seed's and is IMMUTABLE — never write to it, never
+delete from it, never train into it. **Never remove the `{fold}` placeholder or
+hardcode one fold's directory.** A path without it loads the same weights for
+all five folds, so four of the five score on models trained on their own
+targets. The number still prints and it is silently meaningless.
+
+You may retrain. Three hard rules:
+
+1. **A retrain is five training runs, not one.** Every fold needs its own
+   weights, fitted on that fold's `fold_train.csv` and nothing later. Train all
+   five or none — a mixed set is worse than no retrain, because the mixture is
+   invisible in the score.
+2. **Retrain into a versioned, fold-keyed directory.** Use
+   `.cache/ckpt_<id>/{fold}/`, where `<id>` is the id you log for that
+   experiment, and put that literal template in `forecaster.py` so code and
+   weights travel together. A program whose code says `.cache/ckpt_014/{fold}/`
+   must behave identically if re-run later. Never point a program at a
+   directory a subsequent retrain will overwrite.
+3. **Retraining is capped at 4 times.** Five folds per retrain makes this the
+   dominant cost of the run by a wide margin. Count your `retrain` rows in
    `results.tsv` before starting another. This is a wall-clock limit, not a
    quality judgment.
 
-Scoring a program takes about 8 seconds against a 600-second in-evaluator
-budget, so there is a great deal of room for inference-time computation before
-timeouts matter. Training is where the cost is.
+Scoring a program runs 75 windows across five folds and reloads checkpoints once
+per fold. The unmodified seed takes about 32 seconds and scores 44.207. That is
+evaluation 1 of your budget and your reference for what an expensive idea
+costs: a retrain is five training runs and is roughly 500x a scoring run. The evaluator's
+per-fold wall-clock budget is enforced independently of your budget: exceed it
+and the result is `valid: False`, not a slow pass.
 
 ## No surrogate scoring
 

@@ -12,6 +12,7 @@ ckpt_full/
 checkpoints*
 npy/
 */leaderboard/*/vendor/
+.cache
 
 # ---- model binaries ----
 *.pt
