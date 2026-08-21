@@ -1,5 +1,5 @@
 {
-  "source_csv": "/home/dorsa/srip/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv",
+  "source_csv": "/home/dorsa2026/windevolve/wind_forecasting_data/sdwpf_kddcup/sdwpf_245days_v1.csv",
   "layout": "rolling",
   "n_folds": 5,
   "fold_val_days": 30,

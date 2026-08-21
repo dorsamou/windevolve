@@ -169,6 +169,10 @@ _TIER_FEATURES = {
     "farm": _BASE + _INC_TURBINE + _INC_FARM,
     "neighbour": _BASE + _INC_TURBINE + _INC_FARM + _INC_NEIGHBOUR,
     "xy": _BASE + _INC_TURBINE + _INC_FARM + _INC_NEIGHBOUR + _INC_XY,
+    # Non-nested: base plus ONLY the neighbour columns. Every other tier is
+    # cumulative, so this is the only one that isolates what the 3 neighbour
+    # features are worth by themselves.
+    "base+nbr": _BASE + _INC_NEIGHBOUR,
 }
 TIERS = ["power", "base", "turbine", "farm", "neighbour", "xy"]
 
@@ -402,7 +406,7 @@ def _build_features(ctx, t, origin, horizons):
 
 
 def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
-                       feature_set=None, k=None):
+                       feature_set=None, k=None, turbines=None):
     """
     Description:
         Sample forecast origins from the training CSV and build the direct
@@ -415,6 +419,11 @@ def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
         seed: RNG seed for origin sampling
         feature_set: tier name
         k: neighbours per turbine
+        turbines: iterable of turbine indices to sample from, or None for all.
+                  Used by scope="per_turbine" to build one turbine's matrix.
+                  Note the CONTEXT is still built from the whole farm, so the
+                  farm and neighbour feature tiers keep working -- only the rows
+                  are restricted.
     Returns:
         A tuple (X, y) of float arrays.
     """
@@ -426,7 +435,7 @@ def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
 
     Xs, ys = [], []
     lo, hi = DAY_LEN, total - OUTPUT_LEN - 1        # need history behind, truth ahead
-    for t in range(CAPACITY):
+    for t in (range(CAPACITY) if turbines is None else turbines):
         origins = rng.integers(lo, hi, size=n_origins)
         for o in origins:
             Xs.append(_build_features(ctx, t, int(o), horizons))
@@ -437,7 +446,7 @@ def build_training_set(csv_path, n_origins=150, horizon_stride=12, seed=42,
 def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
           model_path=None, n_estimators=None, max_depth=None, learning_rate=None,
           feature_set=None, k=None, subsample=0.8, colsample_bytree=0.8,
-          min_child_weight=1, objective="reg:squarederror"):
+          min_child_weight=1, objective="reg:squarederror", scope="global"):
     """
     Description:
         Fit the global XGBoost model and write it to disk, recording which
@@ -454,6 +463,11 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
         feature_set: tier name
         k: neighbours per turbine for the spatial tiers
         subsample / colsample_bytree / min_child_weight: XGBoost regularisation
+        scope: "global" fits ONE model on all 134 turbines pooled, which is the
+               published baseline. "per_turbine" fits 134 independent models,
+               each seeing only its own turbine's rows. The global model gets
+               134x the data for one parameter set; a per-turbine model gets a
+               specialist fit on roughly 200 days. Which wins is the scope axis.
         objective: XGBoost loss. "reg:squarederror" matches RMSE;
                    "reg:absoluteerror" matches MAE. The competition score is
                    half of each, so neither is the right loss and both are worth
@@ -471,6 +485,41 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
     print("building training set from", csv_path)
     print("  feature set: {} ({} features)".format(fs, len(names)))
     t0 = time.perf_counter()
+
+    def _make():
+        return xgb.XGBRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            subsample=subsample,
+            colsample_bytree=colsample_bytree,
+            min_child_weight=min_child_weight,
+            objective=objective,
+            random_state=seed,
+            n_jobs=-1,
+        )
+
+    if scope == "per_turbine":
+        # One model per turbine. The context is still built farm-wide inside
+        # build_training_set, so neighbour and farm features remain available;
+        # only the training ROWS are restricted to that turbine.
+        models = []
+        for t in range(CAPACITY):
+            Xi, yi = build_training_set(csv_path, n_origins, horizon_stride,
+                                        seed, fs, k, turbines=[t])
+            mi = _make()
+            mi.fit(Xi, yi)
+            models.append(mi)
+            if t % 10 == 0 or t == CAPACITY - 1:
+                print("  turbine {:>3}/{}  ({:,} rows)  {:.1f}s elapsed"
+                      .format(t, CAPACITY - 1, Xi.shape[0],
+                              time.perf_counter() - t0))
+        joblib.dump({"models": models, "features": names, "feature_set": fs,
+                     "scope": "per_turbine",
+                     "k": K_NEIGHBOURS if k is None else k}, model_path)
+        print("saved {} per-turbine models to {}".format(len(models), model_path))
+        return models
+
     X, y = build_training_set(csv_path, n_origins, horizon_stride, seed, fs, k)
     print("  {:,} rows x {} features in {:.1f}s".format(X.shape[0], X.shape[1],
                                                         time.perf_counter() - t0))
@@ -491,6 +540,7 @@ def train(csv_path=None, n_origins=150, horizon_stride=12, seed=42,
     print("  fitted {} trees in {:.1f}s".format(n_estimators, time.perf_counter() - t0))
 
     joblib.dump({"model": model, "features": names, "feature_set": fs,
+                 "scope": "global",
                  "k": K_NEIGHBOURS if k is None else k}, model_path)
     print("saved to", model_path)
     return model
@@ -515,7 +565,12 @@ def _load_model(envs=None):
                 "python baselines/tree/baseline_gbdt.py".format(path))
         print("[gbdt] loading model from: {}".format(path), flush=True)
         blob = joblib.load(path)
-        _CACHE["model"] = blob["model"]
+        _CACHE["scope"] = blob.get("scope", "global")
+        # per-turbine checkpoints hold a list under "models"; global ones hold a
+        # single estimator under "model". Older checkpoints predate the field
+        # and are global by construction.
+        _CACHE["models"] = blob.get("models")
+        _CACHE["model"] = blob.get("model")
         _CACHE["path"] = path
         _CACHE["features"] = blob.get("features", FEATURES)
         _CACHE["feature_set"] = blob.get("feature_set", "base")
@@ -548,8 +603,16 @@ def forecast(envs):
 
     # Build features for every turbine, predict in one batched call for speed.
     blocks = [_build_features(ctx, t, origin, horizons) for t in range(capacity)]
-    X = np.vstack(blocks)                              # (capacity*output_len, n_features)
-    yhat = model.predict(X).reshape(capacity, output_len)
+
+    if _CACHE.get("scope") == "per_turbine":
+        # Each turbine is predicted by its own model, so the blocks cannot be
+        # stacked into one call.
+        models = _CACHE["models"]
+        yhat = np.vstack([models[t].predict(blocks[t])[None, :]
+                          for t in range(capacity)])
+    else:
+        X = np.vstack(blocks)                          # (capacity*output_len, n_features)
+        yhat = model.predict(X).reshape(capacity, output_len)
 
     return np.clip(yhat, 0.0, None)[:, :, None].astype(float)
 

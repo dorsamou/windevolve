@@ -80,7 +80,8 @@ SWEEP_DIR = os.path.join(RUNS_DIR, "sweeps")
 # Column order of the results TSV. Fixed, because plots.py reads it by name and
 # a reordering would silently mislabel a figure.
 COLUMNS = ["ts", "model", "axis", "label", "config", "score", "rmse", "mae",
-           "latest_rmse", "n_windows", "eval_seconds", "fit_seconds",
+           "latest_rmse", "fold_std", "pct_capacity", "fold_scores", "n_folds",
+           "n_windows", "eval_seconds", "fit_seconds", "evals_cumulative",
            "valid", "reason"]
 
 
@@ -176,6 +177,82 @@ def score(module, val_dir, n_windows):
         # bug. Recorded as such so the sweep curve shows where the floor is.
         return {"valid": False, "reason": "{}: {}".format(type(e).__name__, e)}
 
+
+
+# Budget accounting. Number of EVALUATIONS is the common currency across arms,
+# so a hand-tuned baseline must report its own count: a 10-point sweep is 10
+# evaluations spent on that baseline against the 120 an evolved arm gets.
+_EVAL_COUNT = 0
+
+
+def score_folds(module, folds_root, n_windows):
+    """
+    Description:
+        Score a loaded baseline across every fold of a rolling-origin layout,
+        mirroring evaluator.evaluate_folds() but taking a MODULE rather than a
+        path so the sweep's overrides survive.
+
+        A configuration that fails on ANY fold is invalid outright rather than
+        scored on the folds that happened to work: a mean over three folds is
+        not comparable to a mean over five.
+    Args:
+        module: loaded baseline exposing forecast(envs)
+        folds_root: directory containing F1/, F2/, ...
+        n_windows: per-fold cap on windows scored (None = all)
+    Returns:
+        A metrics dict, always containing "valid".
+    """
+    try:
+        fold_dirs = ev._list_folds(folds_root)
+    except Exception as e:
+        return {"valid": False, "reason": "fold discovery failed: {}".format(e)}
+
+    fold_scores, window_scores = {}, []
+    rmses, maes, lrmses, seconds = [], [], [], 0.0
+
+    for fdir in fold_dirs:
+        fname = os.path.basename(fdir)
+        try:
+            r = ev._score_forecaster(
+                module,
+                os.path.join(fdir, "windows"),
+                train_file=os.path.join(fdir, "fold_train.csv"),
+                fold=fname,
+                n_windows=n_windows)
+        except ev.EvalBudgetExceeded as e:
+            return {"valid": False,
+                    "reason": "{}: eval budget exceeded: {}".format(fname, e)}
+        except Exception as e:
+            return {"valid": False,
+                    "reason": "{}: {}: {}".format(fname, type(e).__name__, e)}
+
+        fold_scores[fname] = r["competition_score"]
+        window_scores.extend(r["window_scores"])
+        rmses.append(r["rmse"]); maes.append(r["mae"])
+        lrmses.append(r["latest_rmse"]); seconds += r["eval_seconds"]
+
+    # Mean over FOLDS, not over windows: folds differ in window count and a
+    # fold-weighted mean keeps every period contributing equally.
+    scores = list(fold_scores.values())
+    mean = float(np.mean(scores))
+    return {
+        "competition_score": mean,
+        "rmse": float(np.mean(rmses)),
+        "mae": float(np.mean(maes)),
+        "latest_rmse": float(np.mean(lrmses)),
+        "fold_scores": fold_scores,
+        # fold_std is the spread of this configuration ACROSS REGIMES. A point
+        # that wins on the mean with a large fold_std won on one period, which
+        # is exactly the failure mode folds exist to catch.
+        "fold_std": float(np.std(scores)),
+        "pct_capacity": round(100.0 * mean / ev.FARM_CAPACITY_MW, 3),
+        "fold_worst": max(scores),
+        "window_scores": window_scores,
+        "n_folds": len(fold_scores),
+        "n_windows": len(window_scores),
+        "eval_seconds": round(seconds, 2),
+        "valid": True,
+    }
 
 # ---------------------------------------------------------------------------
 # Grids. Each entry is a dict:
@@ -472,7 +549,7 @@ def grid_gru():
 # from the fit parameters, so re-running a sweep does not refit what it already
 # fitted -- and so the apply_steps and scale axes reuse one fit.
 # ---------------------------------------------------------------------------
-def prepare_arma(fit, module, cache_dir):
+def prepare_arma(fit, module, cache_dir, folds=None):
     """
     Description:
         Fit 134 per-turbine ARIMA models for one (order, fit_days), cached.
@@ -483,6 +560,12 @@ def prepare_arma(fit, module, cache_dir):
     Returns:
         ({"MODEL_PATH": path}, fit_seconds)
     """
+    if folds:
+        raise NotImplementedError(
+            "prepare_arma has no per-fold path yet. Under --folds-root every fold needs "
+            "its OWN fitted artefact, or four of the five score a model trained "
+            "on their own validation targets. To add it: refit each fold on its own fold_train.csv."
+        )
     order = tuple(fit["order"])
     fit_days = int(fit.get("fit_days", 197))
     key = "arma_p{}d{}q{}_f{}.joblib".format(order[0], order[1], order[2], fit_days)
@@ -495,7 +578,7 @@ def prepare_arma(fit, module, cache_dir):
     return {"MODEL_PATH": path}, time.perf_counter() - t0
 
 
-def prepare_gbdt(fit, module, cache_dir):
+def prepare_gbdt(fit, module, cache_dir, folds=None):
     """
     Description:
         Train one global XGBoost model for a configuration, cached. The cache
@@ -511,8 +594,20 @@ def prepare_gbdt(fit, module, cache_dir):
     """
     tag = "_".join("{}{}".format(k, str(v).replace(":", "-"))
                    for k, v in sorted(fit.items()))
-    path = os.path.join(cache_dir, "gbdt_{}.joblib".format(tag))
     t0 = time.perf_counter()
+
+    if folds:
+        # One model PER FOLD, each fitted only on that fold's own prefix. The
+        # returned path keeps the "{fold}" placeholder; the baseline resolves it
+        # from envs["fold"] at scoring time.
+        template = os.path.join(cache_dir, "gbdt_{}_{{fold}}.joblib".format(tag))
+        for fname, fold_train in folds:
+            path = template.format(fold=fname)
+            if not os.path.exists(path):
+                module.train(csv_path=fold_train, model_path=path, **fit)
+        return {"MODEL_PATH": template}, time.perf_counter() - t0
+
+    path = os.path.join(cache_dir, "gbdt_{}.joblib".format(tag))
     if not os.path.exists(path):
         module.train(csv_path=VAL_TRAIN_FILE, model_path=path, **fit)
     return {"MODEL_PATH": path}, time.perf_counter() - t0
@@ -594,7 +689,7 @@ def _gru_cli_flags(script):
     return flags
 
 
-def prepare_gru(fit, module, cache_dir):
+def prepare_gru(fit, module, cache_dir, folds=None):
     """
     Description:
         Train all 134 per-turbine GRUs for one configuration, cached.
@@ -617,6 +712,12 @@ def prepare_gru(fit, module, cache_dir):
     Returns:
         ({"CHECKPOINTS": dir}, fit_seconds)
     """
+    if folds:
+        raise NotImplementedError(
+            "prepare_gru has no per-fold path yet. Under --folds-root every fold needs "
+            "its OWN fitted artefact, or four of the five score a model trained "
+            "on their own validation targets. To add it: retrain 134 models per fold with a per-fold checkpoint dir."
+        )
     import random as _random
     import subprocess
     import torch as _torch
@@ -845,6 +946,227 @@ AXIS_INFO = {
 }
 
 
+
+# ---------------------------------------------------------------------------
+# The four neural baselines (baselines/mlp, lstm, transformer, gru). Every axis
+# retrains, and under --folds-root each point trains once per fold, so cost is
+# 5 x one training run per point. Read the model's .md before sweeping it.
+# ---------------------------------------------------------------------------
+def prepare_neural(fit, module, cache_dir, folds=None):
+    """
+    Description:
+        Train one neural baseline per configuration, cached, and hand back the
+        checkpoint path. Under folds, trains one checkpoint PER FOLD and returns
+        a "{fold}"-templated path which the baseline resolves at scoring time.
+
+        The cache key encodes every fit parameter, so two configurations can
+        never collide on one artefact -- a collision would score the wrong
+        weights and look like a null result rather than a bug.
+    Args:
+        fit: the point's fit dict, passed straight to module.train()
+        module: the loaded baseline (mlp / lstm / transformer)
+        cache_dir: where checkpoints are cached
+        folds: list of (fold_name, fold_train_csv), or None on the single split
+    Returns:
+        ({"CKPT": path_or_template}, fit_seconds)
+    """
+    # NOT module.__name__: load_baseline() names each fresh module
+    # "sweep_candidate_<hash>", which would tag every checkpoint with a hash.
+    name = os.path.splitext(os.path.basename(module.__file__))[0]
+    tag = "_".join("{}{}".format(k, str(v).replace(".", "p"))
+                   for k, v in sorted(fit.items())) or "default"
+    t0 = time.perf_counter()
+
+    if folds:
+        template = os.path.join(cache_dir, "{}_{}_{{fold}}.pt".format(name, tag))
+        for fname, fold_train in folds:
+            path = template.format(fold=fname)
+            if not os.path.exists(path):
+                module.train(train_csv=fold_train, ckpt_path=path,
+                             verbose=False, **fit)
+        return {"CKPT": template}, time.perf_counter() - t0
+
+    path = os.path.join(cache_dir, "{}_{}.pt".format(name, tag))
+    if not os.path.exists(path):
+        module.train(train_csv=VAL_TRAIN_FILE, ckpt_path=path, verbose=False, **fit)
+    return {"CKPT": path}, time.perf_counter() - t0
+
+
+def grid_mlp():
+    """
+    Description:
+        Multi-Layer Perceptron -- the control that isolates nonlinearity from
+        architecture. The only model in the suite with no competition-validated
+        reference configuration, so capacity is the genuinely open question.
+
+        Axes:
+          scope     one global model against 134 per-turbine models. Expect
+                    global to win clearly -- a per-turbine MLP has far too many
+                    weights for one turbine's ~200 days.
+          hidden    two points bracketing the default. 1024 was dropped: 5.9M
+                    weights on ~200 days is not a serious candidate.
+          dropout   two points. If neither helps, the model is not
+                    capacity-limited and the capacity axes can be believed.
+    Args:
+        None
+    Returns:
+        A list of grid points.
+    """
+    pts = [_point("reference", "default (hidden=512 dropout=0.1)", fit={})]
+    pts.append(_point("scope", "scope=per_turbine", fit={"scope": "per_turbine"}))
+    for h in [128]:
+        pts.append(_point("hidden", "hidden={}".format(h), fit={"hidden": h}))
+    for d in [0.3]:
+        pts.append(_point("dropout", "dropout={}".format(d), fit={"dropout": d}))
+    return pts
+
+
+def grid_lstm():
+    """
+    Description:
+        LSTM -- no sweep. Every setting is pinned to the GRU's (144 lookback,
+        48 hidden, 2 layers, dropout 0.05, MSE) so the ONLY difference between
+        the two models is the cell. One configuration, run as the controlled
+        comparison rather than as an exploration.
+    Args:
+        None
+    Returns:
+        A single grid point.
+    """
+    return [_point("reference", "GRU-matched defaults", fit={})]
+
+
+def grid_transformer():
+    """
+    Description:
+        Small patch transformer. ONE axis: patch_len, which sets the token count
+        and therefore both cost and effective context.
+
+        patch_len = 1 IS the vanilla per-timestep transformer -- 144 tokens, no
+        patching. Including it turns the axis into a direct test of PatchTST's
+        central claim, that patching rather than attention does most of the
+        work. If patch 12 clearly beats patch 1, that reproduces here.
+
+        NOTE the budget asymmetry when reporting: every other model gets a real
+        sweep and this one does not, so a loss is evidence at this budget, not
+        evidence that attention cannot work on wind data.
+    Args:
+        None
+    Returns:
+        A list of grid points.
+    """
+    pts = [_point("patch", "patch_len=12 (default)", fit={})]
+    for pl in [1, 6, 24]:
+        lbl = "patch_len={}{}".format(pl, "  (vanilla)" if pl == 1 else "")
+        pts.append(_point("patch", lbl, fit={"patch_len": pl}))
+    return pts
+
+
+# ---------------------------------------------------------------------------
+# PLAN GRIDS -- the trimmed 2026-08 baseline sweep.
+#
+# These replace the older exploratory grids in the registry. The principle is
+# that an axis we expect to do nothing is not worth GPU or CPU hours, so each
+# model keeps only the axes with real headroom. The original grid functions are
+# left in the file and can be restored by editing MODELS.
+# ---------------------------------------------------------------------------
+def plan_climatology():
+    """
+    Description:
+        One axis. Climatology is the floor, not a competitor, and every knob
+        added here is a knob the evolve loop no longer has to discover for
+        itself. Expect n_days to improve monotonically and flatten near 14 --
+        monotone meaning each increase helps, flattening meaning each increase
+        helps LESS, because averaging noise away has diminishing returns.
+    """
+    pts = [_point("n_days", "n_days=10 (default)", {})]
+    for n in [2, 5, 14]:
+        pts.append(_point("n_days", "n_days={}".format(n), {"N_DAYS": n}))
+    return pts
+
+
+def plan_arma():
+    """
+    Description:
+        Two axes. fit_days is capped at 90 because F1 has only 95 training
+        days -- 197 was never runnable on the first fold, so including it would
+        have meant the axis silently meant different things on different folds.
+
+        fit_days is the axis that may overturn an earlier conclusion: on the
+        single split 30 beat 197, which we attributed to temporal adjacency
+        with the validation block rather than to any property of wind. Folds
+        move the validation period five times, so if the 30-day optimum
+        survives, that explanation was wrong.
+    """
+    pts = [_point("order", "order=1,0,1 fit=30 (default)", fit={})]
+    for o in [(1, 0, 0), (2, 0, 1)]:
+        pts.append(_point("order", "order={},{},{}".format(*o), fit={"order": o}))
+    for d in [10, 90]:
+        pts.append(_point("fit_days", "fit_days={}".format(d), fit={"fit_days": d}))
+    return pts
+
+
+def plan_gbdt():
+    """
+    Description:
+        The full XGBoost grid -- the only model in the suite that keeps its
+        capacity axes, because trees are CPU-only and can run alongside the GPU
+        track at no cost to it.
+
+        THE FEATURE AXIS IS THE INTERESTING ONE. The six standard tiers are
+        strictly NESTED:
+
+            power(9) < base(12) < turbine(22) < farm(26) < neighbour(29) < xy(31)
+
+        so each adjacent pair isolates one block of information, and the
+        2.01 MW penalty measured as xy-against-base is the CUMULATIVE effect of
+        four groups. base+nbr is base plus ONLY the three neighbour columns,
+        15 in total, and is the first configuration that isolates spatial
+        information on its own.
+
+        Capacity axes: expect flat or worse. Every one of them indicated
+        overfitting on the single split, so this is a check that the story
+        survives the change of protocol rather than a search for a win.
+    """
+    pts = [_point("reference", "trees=200 depth=4 lr=0.03 tier=base", fit={})]
+    for n in [100, 400]:
+        pts.append(_point("trees", "trees={}".format(n), fit={"n_estimators": n}))
+    for d in [3, 6, 8]:
+        pts.append(_point("depth", "max_depth={}".format(d), fit={"max_depth": d}))
+    for lr in [0.01, 0.1]:
+        pts.append(_point("lr", "learning_rate={}".format(lr),
+                          fit={"learning_rate": lr}))
+    for t in ["power", "turbine", "farm", "neighbour", "xy"]:
+        pts.append(_point("features", "tier={}".format(t), fit={"feature_set": t}))
+    pts.append(_point("features", "tier=base+nbr  (NEW, non-nested)",
+                      fit={"feature_set": "base+nbr"}))
+    pts.append(_point("scope", "scope=per_turbine", fit={"scope": "per_turbine"}))
+    return pts
+
+
+def plan_gru_global():
+    """
+    Description:
+        The scope axis, run on gru_global.py so the official per-turbine port
+        stays untouched. Defaults are the competition's -- 2 layers, 48 hidden,
+        dropout 0.05, lr 1e-4, MSE -- published by the official baseline and
+        independently by Team 88VIP, so they are left alone.
+
+        ON THE LOSS AXIS: the GRU is ALREADY trained on MSE, so smoothness
+        cannot be blamed on L1, and switching to L1 would make it smoother, not
+        less. The competition score is half MAE plus half RMSE, so the matched
+        objective is half-and-half -- that is the one alternative worth the
+        compute. Expect it to move the score slightly and the smoothness barely
+        at all, which is itself a useful negative result.
+    """
+    pts = [_point("reference", "scope=global (default)", fit={})]
+    pts.append(_point("scope", "scope=per_turbine", fit={"scope": "per_turbine"}))
+    pts.append(_point("loss", "loss=half MSE + half L1", fit={"loss": "half"}))
+    for h in [24, 96]:
+        pts.append(_point("hidden", "hidden={}".format(h), fit={"hidden": h}))
+    return pts
+
+
 def axis_info(model, axis):
     """Look up an axis's (kind, core, description), with a safe default."""
     return AXIS_INFO.get((model, axis), ("tuning", True, "(no description)"))
@@ -860,24 +1182,52 @@ MODELS = {
     },
     "climatology": {
         "path": "classical/baseline_climatology.py",
-        "grid": grid_climatology,
+        "grid": plan_climatology,
         "prepare": None,
         "reference": "n_days=14",
         "note": "no fitting; ~1 min per point",
     },
     "arma": {
         "path": "classical/baseline_arima.py",
-        "grid": grid_arma,
+        "grid": plan_arma,
         "prepare": prepare_arma,
         "reference": "order=1,0,1",
         "note": "refits 134 turbines per (order, fit_days); ~5-10 min per fit",
     },
     "gbdt": {
         "path": "tree/baseline_gbdt.py",
-        "grid": grid_gbdt,
+        "grid": plan_gbdt,
         "prepare": prepare_gbdt,
         "reference": "seed=42",
         "note": "retrains per point; ~3-5 min per point",
+    },
+    "gru_global": {
+        "path": "gru/gru_global.py",
+        "grid": plan_gru_global,
+        "prepare": prepare_neural,
+        "reference": "scope=global (default)",
+        "note": "THE scope axis; scope=per_turbine trains 134 models per fold",
+    },
+    "mlp": {
+        "path": "mlp/mlp.py",
+        "grid": grid_mlp,
+        "prepare": prepare_neural,
+        "reference": "default (hidden=512 dropout=0.1)",
+        "note": "retrains per point; ~4-7 h for the whole grid across 5 folds",
+    },
+    "lstm": {
+        "path": "lstm/lstm.py",
+        "grid": grid_lstm,
+        "prepare": prepare_neural,
+        "reference": "GRU-matched defaults",
+        "note": "single configuration; the controlled comparison against the GRU",
+    },
+    "transformer": {
+        "path": "transformer/transformer.py",
+        "grid": grid_transformer,
+        "prepare": prepare_neural,
+        "reference": "patch_len=12 (default)",
+        "note": "one axis, 4 points; patch_len=1 is the vanilla transformer",
     },
     "gru": {
         "path": "gru/gru_baseline.py",
@@ -914,7 +1264,9 @@ def post_load_gru(module, overrides):
 # Runner
 # ---------------------------------------------------------------------------
 def _row(model, pt, res, fit_seconds):
-    """Assemble one TSV row from a scored grid point."""
+    """Assemble one TSV row from a scored grid point, charging one evaluation."""
+    global _EVAL_COUNT
+    _EVAL_COUNT += 1
     cfg = dict(pt["overrides"])
     cfg["scale"] = pt["scale"]
     if pt["fit"]:
@@ -930,9 +1282,20 @@ def _row(model, pt, res, fit_seconds):
         "rmse": round(res["rmse"], 4) if res.get("valid") else "",
         "mae": round(res["mae"], 4) if res.get("valid") else "",
         "latest_rmse": round(res["latest_rmse"], 4) if res.get("valid") else "",
+        # Fold statistics. Empty on the single split, which is itself a useful
+        # marker in the TSV that a row was measured with the old ruler.
+        "fold_std": (round(res["fold_std"], 4)
+                     if res.get("fold_std") is not None else ""),
+        "pct_capacity": res.get("pct_capacity", ""),
+        "fold_scores": (json.dumps({k: round(v, 3)
+                                    for k, v in res["fold_scores"].items()},
+                                   sort_keys=True)
+                        if res.get("fold_scores") else ""),
+        "n_folds": res.get("n_folds", ""),
         "n_windows": res.get("n_windows", ""),
         "eval_seconds": res.get("eval_seconds", ""),
         "fit_seconds": round(fit_seconds, 1),
+        "evals_cumulative": _EVAL_COUNT,
         "valid": int(bool(res.get("valid"))),
         "reason": res.get("reason", ""),
     }
@@ -971,6 +1334,10 @@ def run(model, args):
     """
     spec = MODELS[model]
     points = spec["grid"]()
+    if getattr(args, "skip", None):
+        drop = set(a.strip() for a in args.skip.split(","))
+        points = [p for p in points if p["axis"] not in drop]
+        print("skipping axes: {}".format(", ".join(sorted(drop))))
     if args.only:
         keep = set(args.only.split(","))
         points = [p for p in points if p["axis"] in keep]
@@ -991,8 +1358,38 @@ def run(model, args):
     os.makedirs(SWEEP_DIR, exist_ok=True)
     cache_dir = os.path.join(SWEEP_DIR, "artifacts", model)
     os.makedirs(cache_dir, exist_ok=True)
-    tsv = args.out or os.path.join(SWEEP_DIR, "sweep_{}.tsv".format(model))
+    # The layout is part of what defines a score, so it is part of the filename:
+    # appending fold rows to a single-split TSV would silently mix two rulers.
+    tsv = args.out or os.path.join(
+        SWEEP_DIR, "sweep_{}{}.tsv".format(
+            model,
+            "_folds" if (args.folds_root or os.environ.get("SDWPF_FOLDS_ROOT"))
+            else ""))
     status_path = os.path.splitext(tsv)[0] + ".status.json"
+
+    # Resolve the validation layout ONCE. Folds are the default whenever
+    # --folds-root or $SDWPF_FOLDS_ROOT is set. The single split remains
+    # reachable but is the wrong ruler for tuning -- see score_folds().
+    folds_root = args.folds_root or os.environ.get("SDWPF_FOLDS_ROOT") or None
+    folds = None
+    if folds_root:
+        try:
+            folds = [(os.path.basename(d), os.path.join(d, "fold_train.csv"))
+                     for d in ev._list_folds(folds_root)]
+        except Exception as e:
+            sys.stderr.write("{}\n".format(e))
+            return 1
+        print("layout     : rolling folds -- {}".format(
+            ", ".join(n for n, _ in folds)))
+        print("folds_root : {}".format(folds_root))
+        print("NOTE       : each point trains ONCE PER FOLD "
+              "({} trainings per point).".format(len(folds)))
+    else:
+        print("layout     : SINGLE SPLIT")
+        print("WARNING    : the single split is a calmer, lower-ramp regime than the")
+        print("             dataset as a whole. Hyperparameters tuned on it did not")
+        print("             transfer (val-to-test rank correlation about -0.20).")
+        print("             Pass --folds-root for a sweep you can trust.")
 
     print("model      : {}   ({})".format(model, spec["note"]))
     print("baseline   : {}".format(os.path.join(BASELINES_DIR, spec["path"])))
@@ -1022,13 +1419,15 @@ def run(model, args):
             mod = load_baseline(spec["path"])
             overrides = dict(pt["overrides"])
             if pt["fit"] is not None and spec["prepare"] is not None:
-                fit_over, fit_seconds = spec["prepare"](pt["fit"], mod, cache_dir)
+                fit_over, fit_seconds = spec["prepare"](
+                    pt["fit"], mod, cache_dir, folds=folds)
                 overrides.update(fit_over)
             if model == "gru":
                 post_load_gru(mod, overrides)
             apply_overrides(mod, overrides)
             wrap_scale(mod, pt["scale"])
-            res = score(mod, VAL_DIR, args.windows)
+            res = (score_folds(mod, folds_root, args.windows) if folds_root
+                   else score(mod, VAL_DIR, args.windows))
         except Exception as e:
             traceback.print_exc()
             res = {"valid": False, "reason": "{}: {}".format(type(e).__name__, e)}
@@ -1043,8 +1442,10 @@ def run(model, args):
             if ref_score is None:
                 ref_score = res["competition_score"]
             delta = res["competition_score"] - ref_score
-            verdict = "{:8.3f} MW  ({:+.3f} vs ref)".format(
-                res["competition_score"], delta)
+            spread = ("  +/-{:.2f}".format(res["fold_std"])
+                      if res.get("fold_std") is not None else "")
+            verdict = "{:8.3f} MW{}  ({:+.3f} vs ref)".format(
+                res["competition_score"], spread, delta)
         else:
             verdict = "INVALID   {}".format(res.get("reason", "")[:70])
 
@@ -1155,6 +1556,14 @@ def main():
                     help="cap validation windows (default: all; use 2-3 to smoke test)")
     ap.add_argument("--only", type=str, default=None,
                     help="comma-separated axes to run, e.g. 'seed,scale'")
+    ap.add_argument("--skip", type=str, default=None,
+                    help="comma-separated axes to EXCLUDE, e.g. 'scope'. The "
+                         "complement of --only; used to hold back the expensive "
+                         "per-turbine points for a separate run")
+    ap.add_argument("--folds-root", type=str, default=None,
+                    help="rolling-origin fold directory (F1/, F2/, ...). Defaults "
+                         "to $SDWPF_FOLDS_ROOT. Without it the sweep falls back to "
+                         "the single split, which is the wrong ruler for tuning")
     ap.add_argument("--out", type=str, default=None, help="results TSV path")
     args = ap.parse_args()
 
