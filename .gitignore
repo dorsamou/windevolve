@@ -37,5 +37,5 @@ __pycache__/
 .DS_Store
 
 # karpathy workspace is its own git repo, pushed separately
-windevolve_sdwpf/arms/karpathy/workspace/
-windevolve_sdwpf/arms/karpathy/ws/
+windevolve_sdwpf/autoresearch/workspace/
+windevolve_sdwpf/autoresearch/ws/
