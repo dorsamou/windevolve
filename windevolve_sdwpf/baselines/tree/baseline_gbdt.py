@@ -3,62 +3,40 @@
 path: windevolve_sdwpf/baselines/tree/baseline_gbdt.py
 
 Description:
-    Tier-2 machine-learning baseline: gradient boosted decision trees (XGBoost).
+    Gradient boosted decision trees (XGBoost). ONE GLOBAL model shared by all
+    134 turbines.
 
-    ONE GLOBAL model shared by all 134 turbines, which makes it the closest
-    structural analogue to an evolved single-function forecaster and the fair
-    comparator for the "does it generalize across turbines" question.
+    DIRECT multi-horizon regression. Each training row is one (turbine, forecast
+    origin, horizon step) triple; the horizon distance h is an INPUT feature, so
+    the model is called once per step and the 48h trajectory is produced without
+    recursion -- errors never compound.
 
-    Formulation: DIRECT multi-horizon regression. Each training row is one
-    (turbine, forecast origin, horizon step) triple. The features summarize the
-    state at the origin plus the horizon distance; the target is the actual
-    power at origin + h. At prediction time the same features are built for
-    h = 1..288 and the model is called once per turbine, so the full 48h
-    trajectory is produced directly (no recursion, so no error compounding).
+    FEATURE_SET selects which columns the model sees. Six tiers are NESTED, each
+    a strict superset of the one before, plus one NON-NESTED tier:
 
-    FEATURE SETS. The feature list is not fixed. FEATURE_SET selects one of six
-    NESTED tiers, each a strict superset of the one before, so the difference
-    between two adjacent tiers isolates exactly what the added information is
-    worth:
+        power       own past power and time only -- NO wind speed      (9 cols)
+        base        + wind speed                                      (12 cols)
+        base+nbr    base + ONLY the 3 neighbour columns  <- DEFAULT   (15 cols)
+        turbine     + this turbine's other SCADA channels             (22 cols)
+        farm        + farm-wide aggregates                            (26 cols)
+        neighbour   + the k nearest turbines' power and wind speed    (29 cols)
+        xy          + the turbine's raw x/y coordinates               (31 cols)
 
-        power       own past power and time only -- NO wind speed
-        base        + wind speed  (the original 12 features; the reference)
-        turbine     + the turbine's other channels: direction, temperatures,
-                      pitch angles, reactive power, a parked-fraction flag
-        farm        + farm-wide aggregates at the origin (all 134 turbines)
-        neighbour   + the k nearest turbines' power and wind speed
-        xy          + the turbine's raw x/y coordinates
+    base+nbr exists because the nested tiers cannot separate the neighbour
+    columns from the sensor columns that precede them. It is the only tier that
+    beat base.
 
-    `power` vs `base` measures what wind speed buys. `farm` and `neighbour`
-    are the SPATIAL tiers, and they answer whether turbine layout carries
-    anything the competition's spatial entrants were after.
-
-    A WARNING ABOUT THE `xy` TIER. Each turbine has unique coordinates, so x/y
-    is a turbine IDENTIFIER in disguise. A tree given x/y can memorise
-    per-turbine behaviour, which quietly converts the global model into 134
-    per-turbine models and destroys the one property that makes this baseline
-    the right comparator for the generalisation question. It is included
-    because the comparison is informative, and it must be reported separately
-    rather than folded into "the tuned XGBoost". `farm` and `neighbour` do not
-    have this problem: both are aggregates over OTHER turbines and carry no
-    identity.
+    Sweep results and the reasoning behind every default are in baseline_gbdt.md.
 
 Citation:
-    Program contract and scoring follow the official Baidu KDD Cup 2022 SDWPF
-    evaluator (PaddlePaddle/PaddleSpatial,
-    apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
-    Dataset: Zhou et al., arXiv:2208.04360 (2022);
-             Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
+    Contract and scoring follow the official Baidu KDD Cup 2022 SDWPF evaluator
+    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
+    Dataset: Zhou et al., arXiv:2208.04360 (2022).
 
 Example usage:
-    # Run from the package root (windevolve_sdwpf/):
-    # 1. Train the global model (writes gbdt_model.joblib):
     python baselines/tree/baseline_gbdt.py --origins 150
-    python baselines/tree/baseline_gbdt.py --features neighbour --origins 150
-    # 2. Score it with the official metric:
+    python baselines/tree/baseline_gbdt.py --features base+nbr --origins 150
     python evaluation/evaluator.py baselines/tree/baseline_gbdt.py
-    # 3. Or sweep every tier at once:
-    python analysis/sweep.py gbdt --only features
 """
 import os                                  # paths and env vars
 import time                                # training timers
@@ -88,54 +66,15 @@ MODEL_PATH = os.environ.get("SDWPF_GBDT_MODEL", os.path.join(_HERE, "gbdt_model.
 # file would leak the validation period into the model.
 TRAIN_CSV = VAL_TRAIN_FILE
 
-# Which nested feature tier to use.
-#
-# MEASURED, against a noise floor of +/-0.396 MW:
-#
-#   power      9 feats  45.834      base minus wind speed
-#   base      12 feats  46.139  <-- DEFAULT
-#   turbine   22 feats  48.151      +2.01 MW WORSE, roughly 5 sigma
-#   farm      26 feats  47.582
-#   neighbour 29 feats  47.789
-#   xy        31 feats  47.609
-#
-# More information makes this model WORSE, not better. Three readings:
-#
-#   power -> base       wind speed at the origin buys nothing measurable. The
-#                       target is 48h out and nearly independent of present
-#                       wind; without a weather forecast there is little to use.
-#   base -> turbine     the largest single effect in the sweep, and negative.
-#                       These are origin-time snapshots held constant across all
-#                       288 horizons, so they let the model fit the origin state
-#                       when the distant target does not depend on it -- and
-#                       colsample_bytree dilutes the few useful columns among 22.
-#                       Consistent with every capacity axis saying "overfitting".
-#   neighbour -> xy     turbine coordinates uniquely identify a turbine, so this
-#                       is the strongest available invitation to memorise
-#                       per-turbine behaviour. It changes nothing, which is
-#                       evidence there is little turbine-specific structure to
-#                       exploit. Relevant to the project's generalisation
-#                       question; report it separately, never as "tuned XGBoost".
-#
-# The turbine tier may deserve a retest at the tuned capacity below, since the
-# penalty may reflect over-capacity rather than the features themselves.
-FEATURE_SET = os.environ.get("SDWPF_GBDT_FEATURES", "base")
+# Which column set the model sees. THE HEADLINE AXIS -- see the .md.
+# base+nbr = base(12) + the 3 neighbour columns = 15. The only tier that beat
+# base, and the only NON-NESTED one.
+FEATURE_SET = os.environ.get("SDWPF_GBDT_FEATURES", "base+nbr")
 
-# ---------------------------------------------------------------------------
-# Model capacity. All three defaults come from the sweep on the 197/48
-# validation split; see docs/baseline_report.md section 4.5.
-#
-#   trees   200  45.445   400  46.139   800  46.683
-#   depth     4  45.512     6  46.139     9  47.180
-#   lr     0.03  45.759  0.05  46.139   0.1  47.231
-#
-# Every axis is monotonic toward a SMALLER model, each at 3-4 sigma of the
-# measured noise floor (+/-0.396 MW): this model overfits at the original
-# settings. CAVEAT: each optimum sits at the EDGE of the swept range, so the
-# true optimum is below these values and 45.445 is a lower bound rather than
-# this model's best. Extending the grid downward (trees 50/100, depth 2/3,
-# lr 0.01/0.02) is an open item.
-# ---------------------------------------------------------------------------
+# Model capacity. All three were swept under 5-fold CV and none of them matters:
+# trees spans 0.008 MW across 100/200/400, learning_rate spans 0.010 MW across
+# 0.01/0.03/0.1. max_depth is the only one with structure and gets monotonically
+# worse past 4 -- the overfitting signature. See the .md.
 N_ESTIMATORS = 200            # boosting rounds
 MAX_DEPTH = 4                 # maximum tree depth
 LEARNING_RATE = 0.03          # shrinkage applied to each tree's contribution
@@ -143,12 +82,7 @@ LEARNING_RATE = 0.03          # shrinkage applied to each tree's contribution
 # How many nearest turbines the "neighbour" tier aggregates over.
 K_NEIGHBOURS = int(os.environ.get("SDWPF_GBDT_K", "5"))
 
-# ---------------------------------------------------------------------------
-# Feature tiers. Nested by SET, and `base` keeps the ORIGINAL column order so a
-# model retrained at the reference configuration is identical to the one that
-# produced the previously reported number -- a reordering would perturb which
-# columns colsample_bytree draws and move the score for no reason.
-# ---------------------------------------------------------------------------
+
 _BASE = ["h", "hour_of_day", "patv_last", "patv_mean_1h", "patv_mean_6h",
          "patv_mean_24h", "patv_std_24h", "wspd_last", "wspd_mean_6h",
          "wspd_mean_24h", "patv_yesterday", "patv_turbine_mean"]

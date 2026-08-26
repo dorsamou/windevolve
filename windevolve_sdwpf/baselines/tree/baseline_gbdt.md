@@ -1,308 +1,116 @@
-# Gradient Boosted Trees Baseline (XGBoost)
+# XGBoost Baseline
 
-Reference for `baseline_gbdt.py`
+Reference for `baselines/tree/baseline_gbdt.py`
 
-##  gradient boosting 
+> **CHAMPION — `feature_set = base+nbr`, 44.079 MW (5-fold CV).**
 
-It builds trees **in sequence, each correcting the previous ones' errors**:
+---
 
-1. Tree 1 makes a rough prediction.
-2. Look at its errors (where it was too high or too low).
-3. Tree 2 is trained to predict *those errors* — the correction.
-4. Add tree 2's correction on top of tree 1.
-5. Look at the remaining errors, train tree 3 on those, and so on.
+## The whole model
 
-Each tree only nudges the prediction a little (the "learning rate" shrinks its contribution). After a few hundred trees, the sum is highly accurate. The "gradient" in the name comes from the fact that fitting each new tree to the leftover errors is a gradient-descent step on the loss.
+**One global model** shared by all 134 turbines
 
-So **GBDT = Gradient Boosted Decision Trees** = hundreds of small trees, each correcting the last, summed together. This implementation uses **XGBoost**, the library most common in wind-power-forecasting and competition literature.
+**Direct multi-horizon.** Each training row is one `(turbine, forecast origin,
+horizon step)` triple, and the horizon distance `h` is an **input feature**. So
+the model is called once per step.
 
-(Contrast with a random forest, which builds many trees *independently* and averages them. Boosting builds them *sequentially*, each depending on the last — usually more accurate.)
+Called **134 × 288 = 38,592 times per window.**
 
-## How forecasting becomes regression
+### How the ensemble is built
 
-A tree model has no notion of time — it maps a feature vector to a number. So forecasting has to be recast as regression, via **direct multi-horizon regression**:
+200 rounds of the same three steps:
 
-Each training example is one `(turbine, forecast origin, horizon step)` triple:
+1. Start from a constant prediction — the mean
+2. Compute each row's **residual**: actual − current prediction
+3. Fit a depth-4 tree to *those residuals*, add 3% of it, repeat
 
-- **Target:** the actual power at `origin + h`.
-- **Features:** everything known *at the origin*, plus how far ahead we are predicting (`h`).
+Each tree is trained on **what is still wrong**, not on the original target.
+Round 2's tree never sees 480 kW; it sees the 157 kW the ensemble is still short
+by. The learning rate keeps each correction small so 200 noisy estimates can
+average into something reliable.
 
-So the model learns: "given the recent state, and that I am predicting *h* steps ahead, what is the power?" Including `h` as a feature lets **one model** answer for any horizon.
+---
 
-**"Direct" matters.** To predict 48 h ahead, the model builds features and predicts that step in one shot. It does *not* predict step 1, feed that back to predict step 2, and so on (that is "recursive" forecasting, which compounds errors). Direct forecasting has no error snowball.
+## The feature tiers — the headline result
 
-## How the training data is built (step by step)
+Six tiers are **nested**, each a strict superset of the one before. `base+nbr` is
+**non-nested**: `base` plus only the three neighbour columns.
 
-The model learns from thousands of question-and-answer examples, all taken from the 245-day training CSV. One example is:
+| tier | cols | score (MW) | vs base | **increment** | `fold_std` |
+|---|---|---|---|---|---|
+| power | 9 | 44.683 | +0.461 | | 5.23 |
+| **base** | 12 | 44.222 | — | **−0.461** | 5.03 |
+| **base+nbr** | **15** | **44.079** | **−0.143** | | **5.16** |
+| turbine | 22 | 45.468 | +1.246 | **+1.246** | 3.73 |
+| farm | 26 | 45.512 | +1.290 | +0.044 | 3.76 |
+| neighbour | 29 | 45.387 | +1.165 | −0.125 | 3.78 |
+| xy | 31 | 45.226 | +1.004 | −0.161 | 3.85 |
 
-- **Question (features):** numbers describing "now" (the origin) plus how far ahead we are asking (the horizon `h`).
-- **Answer (target):** the actual power `h` steps after "now" — which we can simply look up, because it is historical data.
+The **increment** column is what each group adds on top of the tier before it —
+the only interpretable quantity in a nested chain.
 
-**One origin makes many rows.** Pick a random moment ("now"). The "now" numbers — power now, recent averages, wind now — are computed once. Then we vary `h` and make one row per value:
+### Four readings
 
-```
-"now" numbers fixed:  power=500, last-hour-avg=480, wind=7, ...
+**Wind speed is worth 0.461 MW.** That is the `power → base` step, and it is the
+only clean measurement of what reading wind speed at all buys. Smaller than most
+people expect.
 
-row h=1:   [ ...now numbers..., h=1  ]   answer: power 1 step later
-row h=2:   [ ...now numbers..., h=2  ]   answer: power 2 steps later
-row h=3:   [ ...now numbers..., h=3  ]   answer: power 3 steps later
-...
-```
+**The sensor columns cost 1.246 MW** — ten columns (`wdir_sin/cos`, `etmp_last`,
+`itmp_last`, `pab_max_last`, `prtv_last`, `zero_frac_24h`, `wspd_std_24h`,
+`patv_mean_48h`, `wspd_yesterday`) costing nearly three times what wind speed
+gains. This is the entire "2.01 MW penalty" from the earlier work, now localised.
 
-The "now" numbers repeat across these rows; only `h` (and the two features that depend on the predicted step, `hour_of_day` and `patv_yesterday`) change. So **one origin fans out into a block of rows, one per horizon step.**
+**Farm aggregates do nothing: +0.044 MW.**
 
-**Many origins, all turbines, piled together.** We repeat this at 150 random origins, for each of the 134 turbines, and stack every resulting row into one big matrix. That matrix is the training set handed to XGBoost.
+**Neighbour and xy help slightly** inside the nested chain (−0.125, −0.161), but
+they are recovering ground in an already-damaged model and cannot undo the
+sensor cost.
 
-**Striding, for volume.** Making a row for every `h` from 1 to 288 would give 150 × 134 × 288 ≈ 5.8 M rows. `--stride 12` keeps only every 12th horizon (`h = 1, 13, 25, ..., 277` — 24 of the 288), cutting this to ~480 K rows, which trains far faster. The model does not lose the skipped steps: `h` is just a number it learns a smooth relationship over, so it interpolates to `h = 7` fine even having trained only on `h = 1` and `h = 13` — like fitting a smooth curve from 24 points instead of 288.
 
-**One asymmetry to remember:** training is *strided* (every 12th `h`, for speed), but prediction is *not* — `forecast` uses every `h` from 1 to 288, because there we want the complete 48 h trajectory, not a training sample.
+---
 
-The three terms, plainly:
-- **origin** — one "now", a random moment we build examples from.
-- **horizon (`h`)** — how far ahead the question asks.
-- **feature** — one of the numbers in the question (power now, wind now, `h`, ...).
+**All of the tier difference comes from one fold.**
 
-## Algorithm note: how it trains, how it predicts
+| fold | base | base+nbr | turbine | farm | neighbour | xy | gap |
+|---|---|---|---|---|---|---|---|
+| F1 | 47.3 | 47.2 | 47.8 | 47.6 | 47.5 | 47.4 | 0.6 |
+| F2 | 47.8 | 47.7 | 47.2 | 47.5 | 47.4 | 47.3 | 0.6 |
+| F3 | 40.1 | 40.1 | 39.9 | 39.8 | 39.8 | 39.7 | 0.4 |
+| F4 | 49.4 | 49.4 | 50.0 | 50.1 | 50.0 | 50.0 | 0.7 |
+| **F5** | **36.4** | **36.0** | **42.4** | **42.6** | **42.2** | **41.8** | **6.6** |
 
-### Training (fitting the trees to residuals)
+On four folds every tier scores within 0.7 MW. On **F5** they split by 6.6 MW.
 
-Gradient boosting builds the model as a **sum of trees**, each one predicting the leftover error of the trees before it. With squared-error loss (`objective="reg:squarederror"`), that leftover error is exactly the **residual** = actual − current prediction.
+And the arithmetic lands exactly: **6.0 MW ÷ 5 folds = 1.2 MW**, which is the
+reported penalty. 
 
-```
-start:      prediction P0 = a constant (the mean target)
-round 1:    residual r1 = actual − P0
-            fit tree T1 to predict r1
-            P1 = P0 + lr · T1            (lr = learning rate, e.g. 0.05)
-round 2:    residual r2 = actual − P1
-            fit tree T2 to predict r2
-            P2 = P1 + lr · T2
-...
-round N:    residual rN = actual − P(N−1)
-            fit tree TN to predict rN
-            PN = P(N−1) + lr · TN
 
-final model:  prediction = P0 + lr · (T1 + T2 + ... + TN)
-```
+## Capacity sweep
 
-Each tree only nudges the prediction by a small fraction `lr`, so no single tree dominates and the sum converges gradually. Fitting each tree to the residual is a gradient-descent step on the squared-error loss — hence "gradient" boosting. In this baseline `N = --trees` (default 400), each tree at most `--depth` deep (default 6).
+| axis | values | range |
+|---|---|---|
+| trees | 100 / **200** / 400 | **0.008 MW** |
+| learning_rate | 0.01 / **0.03** / 0.1 | **0.010 MW** |
+| max_depth | 3 / **4** / 6 / 8 | 0.455 MW |
 
-Building the training rows (origins × horizons, described above) happens once, up front; then all `N` rounds run on that fixed matrix.
 
-### Prediction (summing the trees)
-
-At forecast time the trees are fixed. For one input row, prediction is just the constant plus every tree's shrunk output added up:
-
-```
-prediction = P0 + lr · (T1(row) + T2(row) + ... + TN(row))
-```
-
-For a full forecast, one turbine's `(288, 12)` feature matrix (every horizon `h = 1..288`, no striding) is passed through all `N` trees at once, giving 288 power values. Repeat for 134 turbines, clip negatives to zero, and return `(134, 288, 1)`.
-
-## Features
-
-All are computed from history at or before the origin — never the future.
-
-| Feature | Why it is there |
-|---|---|
-| `h` | the horizon step; lets one model handle all 288 steps |
-| `hour_of_day` | time of day at the predicted step, for any diurnal shape |
-| `patv_last` | power right at the origin |
-| `patv_mean_1h`, `patv_mean_6h`, `patv_mean_24h` | recent power level at three timescales |
-| `patv_std_24h` | recent variability |
-| `wspd_last`, `wspd_mean_6h`, `wspd_mean_24h` | **wind speed** — drives the power curve |
-| `patv_yesterday` | power one day before the predicted step |
-| `patv_turbine_mean` | the turbine's typical output (capacity proxy) |
-
-This is the first baseline that reads **wind speed**. On data with a real power curve, feature importance splits sensibly between recent power (the strongest short-term predictor) and wind speed (the power-curve signal).
 
 ## Parameters
 
-| Setting | Default | Meaning |
+| parameter | default | what it is |
 |---|---|---|
-| `--origins` | 150 | forecast origins sampled per turbine |
-| `--stride` | 12 | keep every 12th horizon step (24 of 288) when building training rows |
-| `--trees` | 400 | number of boosting rounds (trees) |
-| `--depth` | 6 | maximum depth of each tree |
-| `--lr` | 0.05 | learning rate (shrinkage per tree) |
-| `--seed` | 42 | RNG seed for sampling and the model |
-| `--model` | `gbdt_model.joblib` | output/input path |
-
-Subsampling is necessary: 134 turbines × ~30,000 origins × 288 horizons is far too many rows. The defaults give a few hundred thousand training rows — fits in memory, trains in minutes on CPU. The fitted model is cached at module level, so it loads once rather than 142 times.
+| `FEATURE_SET` | **`base+nbr`** | Which column set is exposed|
+| `N_ESTIMATORS` | 200 | Boosting rounds, one tree per round |
+| `MAX_DEPTH` | 4 | Up to 4 features interacting per path |
+| `LEARNING_RATE` | 0.03 | Only 3% of each tree's correction is added |
+| `K_NEIGHBOURS` | 5 | Turbines the neighbour columns aggregate over |
+| scope | global | One model for all 134 turbines |
 
 
-## Usage
+## Cost
 
-```bash
-# Train the global model (writes gbdt_model.joblib)
-python baseline_models/tree/baseline_gbdt.py --origins 150
+CPU-only
 
-# Score with the official metric
-python evaluator.py baseline_models/tree/baseline_gbdt.py
-
-# A quicker, smaller model for testing
-python baseline_models/tree/baseline_gbdt.py --origins 50 --trees 100
-```
-
-## Weaknesses
-
-1. **No temporal structure inside the model.** Trees see a fixed feature vector; any notion of sequence must be hand-built as lag features. A poor feature set caps performance.
-2. **Manual feature engineering.** The choice of lags and windows is a human modeling decision — precisely the gap an evolutionary search is meant to close automatically. (A pointed irony worth noting in the writeup.)
-3. **No spatial information.** Turbine coordinates are available in `envs["path_to_locations"]` but unused.
-4. **Sampling variance.** Origins are randomly sampled, so results shift slightly with `--seed`. Average over seeds before claiming a difference from another method.
-
----
-
-## Parameters added for the sweep
-
-### Feature tiers
-
-The feature list is no longer fixed. `FEATURE_SET` (or `--features`) selects one
-of six **nested** tiers, each a strict superset of the one before, so each
-adjacent pair isolates exactly one block of information.
-
-| Tier | Adds | n | The question it answers |
-|---|---|---|---|
-| `power` | — (`base` minus the wind-speed columns) | 9 | |
-| `base` | `wspd_last`, `wspd_mean_6h`, `wspd_mean_24h` | 12 | **what is wind speed worth?** |
-| `turbine` | `wdir_sin`, `wdir_cos`, `etmp_last`, `itmp_last`, `pab_max_last`, `prtv_last`, `zero_frac_24h`, `wspd_std_24h`, `patv_mean_48h`, `wspd_yesterday` | 22 | what are the turbine's other channels worth? |
-| `farm` | `farm_patv_now`, `farm_wspd_now`, `farm_patv_24h`, `turbine_share` | 26 | what is farm-wide state worth? |
-| `neighbour` | `nbr_patv_last`, `nbr_wspd_last`, `nbr_wspd_mean_6h`, over the *k* nearest turbines | 29 | **what is the farm layout worth?** |
-| `xy` | `turb_x`, `turb_y` | 31 | what is turbine *identity* worth? |
-
-`base` reproduces the original 12 features **in the original column order**,
-verified bit-for-bit against the previous implementation across several
-(turbine, origin) pairs. The order matters as well as the set: reordering would
-change which columns `colsample_bytree` draws and move the score for no reason.
-
-### Notes on three of the tiers
-
-**`turbine` gives the model a way to tell *why* a turbine is at zero.** The
-original feature set reads power and wind speed and nothing else. `pab_max_last`
-— the largest of the three pitch angles — says the blades are feathered, i.e.
-the turbine is deliberately spilling wind and will probably still be doing so in
-an hour. `zero_frac_24h` says how much of the last day it spent at zero. Given
-how much of SDWPF is zero-inflated, this is the tier with the most obvious room
-to help. `Wdir` enters as sin/cos rather than degrees because direction is
-circular: 359° and 1° are one degree apart but 358 apart as raw numbers, and a
-tree would otherwise spend splits rediscovering that.
-
-**`farm` and `neighbour` are spatial but carry no identity.** Both are aggregates
-over *other* turbines — the farm mean at the origin, and the mean power and wind
-speed of the *k* nearest turbines from
-`sdwpf_baidukddcup2022_turb_location.csv`. The physical story is that upwind
-turbines see weather before downwind ones do, which is what the competition's
-spatial entrants were after. `k` defaults to 5 and is itself sweepable.
-
-**`xy` is a turbine identifier in disguise, and is reported separately.** Each
-turbine has unique coordinates, so a tree given x/y can memorise per-turbine
-behaviour. That quietly converts the *global* model into 134 private models and
-destroys the one property that makes this baseline the right comparator for the
-generalisation question. It is included because the `neighbour` → `xy` gap is a
-direct estimate of how much of the achievable score is turbine-specific rather
-than transferable — the project's central question in miniature. It is **not**
-part of "the tuned XGBoost".
-
-### Other parameters
-
-| Parameter | Default | Notes |
-|---|---|---|
-| `k` / `--k` | 5 | Nearest turbines aggregated by the `neighbour` tier. |
-| `objective` / `--objective` | `reg:squarederror` | The score is `0.5*(RMSE+MAE)`, so squared error over-weights the tail relative to what is scored and `reg:absoluteerror` under-weights it. Neither is the right loss, which is what makes measuring both informative. |
-| `subsample`, `colsample_bytree`, `min_child_weight` | 0.8, 0.8, 1 | Previously hardcoded; now arguments to `train()`. Defaults unchanged. |
-
-The saved `.joblib` now records `feature_set` and `k` alongside the model, and
-`forecast()` reads the tier **from the checkpoint** rather than from the module
-constant — so a model trained on one tier can never be scored with another
-tier's features.
-
----
-
-## Measured results and the new defaults
-
-From the sweep on the 197/48 validation split (`docs/baseline_report.md` §4.5),
-against a measured evaluation noise floor of **±0.396 MW (1 sd)**.
-
-### Noise floor
-
-Three fits of an identical configuration, differing only in the RNG that samples
-forecast origins and builds trees:
-
-| seed | 42 | 43 | 44 | mean | 1 sd |
-|---|---|---|---|---|---|
-| score (MW) | 46.139 | 46.922 | 46.426 | 46.496 | **0.396** |
-
-A 0.78 MW spread between identical configurations. This is the yardstick for
-every other result here, and for the wider study.
-
-### Capacity — the model was overfitting
-
-| trees | 200 | 400 | 800 | | depth | 4 | 6 | 9 | | lr | 0.03 | 0.05 | 0.1 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| score | **45.445** | 46.139 | 46.683 | | | **45.512** | 46.139 | 47.180 | | | **45.759** | 46.139 | 47.231 |
-
-All three axes monotonic toward a smaller model, each at 3–4σ. Defaults changed
-to `N_ESTIMATORS = 200`, `MAX_DEPTH = 4`, `LEARNING_RATE = 0.03`.
-
-**Caveat:** every optimum sits at the edge of the swept range, so the true
-optimum lies below these values and 45.445 is a *lower bound* on this model's
-performance rather than its best. Extending the grid downward (`trees` 50/100,
-`depth` 2/3, `lr` 0.01/0.02) is an open item.
-
-### Feature tiers — more information made it worse
-
-| tier | features | score | step | vs floor |
-|---|---|---|---|---|
-| power | 9 | **45.834** | — | |
-| **base** | **12** | **46.139** | +0.31 | within noise |
-| turbine | 22 | 48.151 | **+2.01** | ≈5σ |
-| farm | 26 | 47.582 | −0.57 | ≈1.4σ |
-| neighbour | 29 | 47.789 | +0.21 | within noise |
-| xy | 31 | 47.609 | −0.18 | within noise |
-
-`base` remains the default. Three readings:
-
-**Wind speed buys nothing** (`power → base`). The model sees wind speed at the
-forecast origin, and the target is 48 h later, essentially independent of it.
-Without a weather forecast there is little to extract — the no-future-weather
-constraint appearing as a feature ablation.
-
-**The auxiliary channels actively hurt** (`base → turbine`, +2.01 MW, the largest
-single effect in the sweep). Direction, temperatures, blade pitch, reactive power
-and the parked-fraction indicator are all origin-time snapshots held constant
-across all 288 horizons, so they let the model fit the origin state when the
-distant target does not depend on it; and `colsample_bytree` dilutes the few
-useful columns among 22. This is consistent with every capacity axis reporting
-overfitting. The hypothesis that pitch angle would identify parked turbines was
-reasonable and did not survive. Worth retesting at the tuned capacity before
-concluding the features themselves are worthless.
-
-**Neither spatial information nor turbine identity helps.** Farm aggregates and
-nearest-neighbour features both fall inside noise, so the physical story — upwind
-turbines observing weather before downwind ones — does not materialise at this
-horizon. More importantly, supplying each turbine's unique coordinates (`xy`)
-changes nothing: for a *global* model that is the strongest available invitation
-to memorise per-turbine behaviour. **There is little turbine-specific structure
-to exploit**, which bears directly on the project's generalisation question.
-Report `xy` separately; never fold it into "the tuned XGBoost".
-
-### Objective
-
-`reg:absoluteerror` scores 49.104 against 46.139 — 2.97 MW worse, degrading RMSE
-from 50.448 to 54.243 without improving MAE. Note this is the *opposite* of the
-`scale` control's effect, despite both moving predictions toward the median:
-shrinkage applies one global multiplier after fitting, whereas an absolute-error
-objective changes what every tree fits. The metric rewards the first and punishes
-the second. `reg:squarederror` remains the default.
-
-### Standing
-
-At **45.445 MW** this is third of five baselines, behind ARMA (44.324) and the
-GRU (44.537) — despite reading nine sensor channels those two do not. Its value
-in the suite is structural rather than competitive: as the only model shared
-across all 134 turbines, it is the closest analogue to an evolved
-single-function forecaster.
-
-In the regime analysis it is the best model at high power and short horizon
-(0.310 and 0.387 MW at 0–6 h), the only cells where a tree clearly wins, and the
-worst in the parked regime at short horizon. It is differently shaped rather than
-uniformly weaker.
+Under folds each fold needs its own model, fitted on that fold's own
+`fold_train.csv` — reusing one across folds would mean four of five scored a
+model trained on their own validation targets.

@@ -1,47 +1,33 @@
 """
-path: windevolve_sdwpf/baselines/neural/lstm.py
+path: windevolve_sdwpf/baselines/lstm/lstm.py
 
 Description:
-    Long Short-Term Memory encoder with a flat projection head. Walks the
-    window one step at a time carrying TWO summaries, then emits all 288
-    horizon steps in one projection from the final hidden state.
+    Long Short-Term Memory encoder. Walks the window
+    one step at a time carrying TWO summaries -- a hidden state and a cell state
+    -- then emits all 288 horizon steps in one projection from the final hidden
+    state.
 
-    THE TWO STATES. "48 units" does not mean 48 numbers in total -- it means
-    the state is 48 slots wide, and in an LSTM each slot carries two numbers.
-    The CELL state is the long-term ledger: the forget gate multiplies it
-    elementwise by a value in (0,1), then the input gate adds a bounded
-    contribution, so it is EDITED rather than rewritten. The HIDDEN state is
-    the cell state passed through tanh and filtered by the output gate, and it
-    is the only one the next layer and the next timestep see.
+    Every setting is pinned to the GRU's REFERENCE configuration, so the ONLY
+    difference between this and gru_baseline.py at hidden 48 is the cell. That
+    makes it a controlled comparison rather than two loosely related models,
+    which is why it gets no sweep of its own.
 
-    At each step every unit reads the 10 current channels AND all 48 previous
-    hidden values -- 58 numbers in. Weights come in pairs accordingly:
-    48 x 10 for the input and 48 x 48 for the recurrence, times four gates.
+    Self-contained by design -- the whole pipeline is inlined so this file works
+    as a seed program for an evolve arm with nothing else on disk.
 
-    WHY IT IS HERE. Every setting is pinned to the GRU's -- 144 lookback,
-    48 hidden, 2 layers, dropout 0.05, MSE -- so the ONLY difference between
-    the two models is the cell. That makes it a controlled comparison rather
-    than two loosely related models, which is why it gets no sweep of its own.
+    Sweep results and the two-state explanation are in lstm.md.
 
 Citation:
-    Hochreiter and Schmidhuber, "Long Short-Term Memory", Neural Computation
-    9(8), 1997. Settings mirror the official SDWPF GRU baseline
-    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru), independently
-    confirmed by Team 88VIP (arXiv:2208.08952, Table 3).
+    Hochreiter and Schmidhuber, Neural Computation 9(8), 1997. Settings mirror
+    the official SDWPF GRU baseline (PaddlePaddle/PaddleSpatial), independently
+    confirmed by Lin et al., arXiv:2208.08952, Table 3.
     Dataset: Zhou et al., arXiv:2208.04360 (2022).
 
 Example usage:
-    # from the package root (windevolve_sdwpf/)
-    python baselines/neural/lstm.py --epochs 2 --ckpt /tmp/lstm_smoke.pt
+    python baselines/lstm/lstm.py --epochs 2 --ckpt /tmp/lstm_smoke.pt
 
-    for F in F1 F2 F3 F4 F5; do
-      python baselines/neural/lstm.py \
-          --train-csv evaluation/splits_rolling_5x30/$F/fold_train.csv \
-          --ckpt baselines/neural/checkpoints/lstm_$F.pt
-    done
-
-    export SDWPF_LSTM_CKPT="baselines/neural/checkpoints/lstm_{fold}.pt"
-    python evaluation/evaluator.py baselines/neural/lstm.py \
+    export SDWPF_LSTM_CKPT="baselines/lstm/checkpoints/lstm_{fold}.pt"
+    python evaluation/evaluator.py baselines/lstm/lstm.py \
         --folds-root evaluation/splits_rolling_5x30
 """
 import os                                    # paths, env vars
@@ -56,7 +42,7 @@ import torch                                 # tensors
 import torch.nn as nn                        # layers and loss
 from torch.utils.data import Dataset, DataLoader
 
-# baselines/neural/ -> baselines/ -> repo root. Added so this file works when
+# baselines/<model>/ -> baselines/ -> repo root. Added so this file works when
 # run directly, when imported by the sweep harness, when loaded by
 # evaluator.py, and when handed to an evolve arm.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +57,7 @@ from paths import VAL_TRAIN_FILE
 # ===========================================================================
 # SHARED PIPELINE -- data, scaler, windowing, training, inference.
 #
-# Duplicated verbatim across mlp.py / lstm.py / transformer.py so each file is
+# Duplicated verbatim across mlp.py / lstm.py / transformer.py / gru_baseline.py
 # a complete, independently-evolvable program. Keep the copies in sync by hand;
 # a divergence here silently makes their scores incomparable.
 # ===========================================================================
@@ -83,6 +69,7 @@ START_COL = 3           # first modeled column (Wspd)
 N_FEATURES = 10         # Wspd Wdir Etmp Itmp Ndir Pab1 Pab2 Pab3 Prtv Patv
 PATV_IDX = 9            # index of Patv within the modeled columns -- the target
 MAX_LOOKBACK = 2016     # 14 days: what each window infile supplies
+RATED_KW = 1500.0       # a turbine's rated capacity -- the physical output ceiling
 
 
 def resolve_fold_path(envs, template):
@@ -424,7 +411,7 @@ def load_checkpoint(path, device=None):
     return out
 
 
-def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
+def predict_windows(envs, ckpt_template, device=None, clip_output=True):
     """
     Description:
         The body of forecast(envs): resolve this fold's checkpoint, read the
@@ -435,7 +422,12 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
         envs: evaluator settings dict, needs "path_to_test_x" and, under folds, "fold"
         ckpt_template: checkpoint path, optionally containing "{fold}"
         device: torch device string
-        clip_negative: clamp predictions at 0 (power cannot be negative)
+        clip_output: clamp predictions to [0, RATED_KW]. A turbine cannot
+                     produce negative power, and cannot exceed its rating -- so
+                     a forecast outside that range is not a forecast. Cheap
+                     insurance: it is worth almost nothing on the metric, which
+                     averages 38,592 predictions per window, but it stops the
+                     model emitting values that are physically impossible.
     Returns:
         float array (capacity, OUTPUT_LEN, 1) of predicted Patv in kW.
     """
@@ -472,8 +464,8 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
                 p = m(torch.from_numpy(xs).float().to(device)).cpu().numpy()
                 out[tid] = sc.inverse_target(p)[0]
 
-    if clip_negative:
-        out = np.clip(out, 0.0, None)
+    if clip_output:
+        out = np.clip(out, 0.0, RATED_KW)
     return out.reshape(capacity, OUTPUT_LEN, 1).astype(float)
 
 
@@ -513,13 +505,17 @@ CKPT = os.environ.get(
     "SDWPF_LSTM_CKPT",
     os.path.join(_HERE, "checkpoints", "lstm_{fold}.pt"))
 
-LOOKBACK = 144          # pinned to the GRU baseline
+# Every setting below is pinned to the GRU's REFERENCE configuration (hidden 48),
+# NOT its champion (hidden 96). That is deliberate: the LSTM was measured against
+# the GRU at hidden 48, so LSTM 45.083 vs GRU 43.786 isolates the CELL and
+# nothing else. Raising this to 96 would ship a configuration nobody measured.
+LOOKBACK = 144          # pinned to the GRU reference
 SCOPE = "global"        # "global" (1 model) or "per_turbine" (134 models)
 HIDDEN = 48             # width of EACH of the two state vectors
-LAYERS = 2              # stacked LSTM layers
-DROPOUT = 0.05          # pinned to the GRU baseline
-LOSS = "mse"            # pinned to the GRU baseline
-CLIP_NEGATIVE = True
+LAYERS = 2              # pinned to the GRU reference
+DROPOUT = 0.05          # pinned to the GRU reference
+LOSS = "mse"            # pinned to the GRU reference
+CLIP_OUTPUT = True     # clamp to [0, RATED_KW]; see the .md
 
 
 def default_config(**overrides):
@@ -613,7 +609,7 @@ def forecast(envs):
     Returns:
         float array (134, 288, 1) of predicted Patv in kW.
     """
-    return predict_windows(envs, CKPT, clip_negative=CLIP_NEGATIVE)
+    return predict_windows(envs, CKPT, clip_output=CLIP_OUTPUT)
 
 
 def main():

@@ -1,62 +1,34 @@
 """
-path: windevolve_sdwpf/baselines/gru/gru_global.py
+path: windevolve_sdwpf/baselines/transformer/transformer.py
 
 Description:
-    Gated Recurrent Unit with a flat projection head, written against the same
-    pipeline as the other neural baselines so that SCOPE can be swept.
+    Small patch-based transformer encoder with a flat projection head. The window
+    is cut into patches of PATCH_LEN steps, each patch becomes one token, the
+    tokens attend to each other, and the result is flattened and projected to all
+    288 horizon steps at once.
 
-    WHY THIS FILE EXISTS ALONGSIDE gru/gru_baseline.py. The official port is
-    per-turbine by construction: it fits 134 independent models and has no
-    global mode. Sweeping scope on it would mean rewriting a faithful port of
-    the published baseline, which we do not want to touch. This file runs the
-    SAME cell at either scope, so scope=global against scope=per_turbine is a
-    clean one-variable comparison, and gru_baseline.py stays untouched as the
-    published reference.
+    Deliberately tiny -- about 71k parameters at the default patch_len of 24 --
+    because roughly 200 days per fold cannot support a large transformer. Note
+    that most of that parameter count is the final linear projection, not the
+    attention.
 
-    THE CELL. Two gates per step, both sigmoid so they output a FRACTION:
-    update (how much of the old summary to keep) and reset (how much of it to
-    use when forming the candidate). The candidate itself is tanh, because it
-    is signed content rather than a fraction -- the summary must be able to
-    move down as well as up, and tanh bounds it to (-1, 1). Neither activation
-    is a tuning choice; they are what make this a GRU.
+    patch_len = 1 recovers the vanilla per-timestep transformer.
 
-    At each step every unit reads the 10 current channels AND all 48 previous
-    hidden values -- 58 numbers in, one out, times 48 units. Weights come in
-    pairs accordingly: 48 x 10 for the input and 48 x 48 for the recurrence,
-    times three gates. About 23k weights per model.
+    Self-contained by design -- the whole pipeline is inlined so this file works
+    as a seed program for an evolve arm with nothing else on disk.
 
-    DEFAULTS ARE THE COMPETITION'S. 2 layers, 48 hidden, dropout 0.05,
-    lr 1e-4, Adam, MSE loss -- from the official Baidu baseline, and
-    independently published by Team 88VIP (arXiv:2208.08952, Table 3). They are
-    left alone; scope is the axis with real headroom.
-
-    ONE DIFFERENCE FROM THE OFFICIAL PORT, stated plainly: the official
-    baseline unrolls 432 steps (144 real, 288 zero-padded) and reads one output
-    per step, discarding the first 144. This file uses a flat head instead --
-    the whole horizon in one projection from the final state. That is the same
-    choice the LSTM and Transformer baselines make, so the three stay
-    comparable, but it means this is not a byte-for-byte reproduction of the
-    published GRU.
+    Sweep results and the step-by-step dimensions are in transformer.md.
 
 Citation:
-    Cho et al., "On the Properties of Neural Machine Translation", SSST-8, 2014.
-    Hyperparameters from the official SDWPF GRU baseline
-    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru) and Lin et al.,
-    arXiv:2208.08952, Table 3.
+    Vaswani et al., NeurIPS 2017, arXiv:1706.03762. Patching follows Nie et al.,
+    ICLR 2023, arXiv:2211.14730, sized down for this dataset.
     Dataset: Zhou et al., arXiv:2208.04360 (2022).
 
 Example usage:
-    # from the package root (windevolve_sdwpf/)
-    python baselines/gru/gru_global.py --epochs 2 --ckpt /tmp/gru_smoke.pt
+    python baselines/transformer/transformer.py --epochs 2 --ckpt /tmp/tst.pt
 
-    for F in F1 F2 F3 F4 F5; do
-      python baselines/gru/gru_global.py \
-          --train-csv evaluation/splits_rolling_5x30/$F/fold_train.csv \
-          --ckpt baselines/gru/checkpoints/gru_global_$F.pt
-    done
-
-    export SDWPF_GRUG_CKPT="baselines/gru/checkpoints/gru_global_{fold}.pt"
-    python evaluation/evaluator.py baselines/gru/gru_global.py \
+    export SDWPF_TST_CKPT="baselines/transformer/checkpoints/transformer_{fold}.pt"
+    python evaluation/evaluator.py baselines/transformer/transformer.py \
         --folds-root evaluation/splits_rolling_5x30
 """
 import os                                    # paths, env vars
@@ -64,7 +36,7 @@ import sys                                   # package-root discovery
 import time                                  # timing
 import random                                # seeding
 import argparse                              # training CLI
-
+import math                                  # positional encoding
 import numpy as np                           # array math
 import pandas as pd                          # CSV reading
 import torch                                 # tensors
@@ -86,7 +58,7 @@ from paths import VAL_TRAIN_FILE
 # ===========================================================================
 # SHARED PIPELINE -- data, scaler, windowing, training, inference.
 #
-# Duplicated verbatim across mlp.py / lstm.py / transformer.py / gru_global.py
+# Duplicated verbatim across mlp.py / lstm.py / transformer.py / gru_baseline.py
 # a complete, independently-evolvable program. Keep the copies in sync by hand;
 # a divergence here silently makes their scores incomparable.
 # ===========================================================================
@@ -98,6 +70,7 @@ START_COL = 3           # first modeled column (Wspd)
 N_FEATURES = 10         # Wspd Wdir Etmp Itmp Ndir Pab1 Pab2 Pab3 Prtv Patv
 PATV_IDX = 9            # index of Patv within the modeled columns -- the target
 MAX_LOOKBACK = 2016     # 14 days: what each window infile supplies
+RATED_KW = 1500.0       # a turbine's rated capacity -- the physical output ceiling
 
 
 def resolve_fold_path(envs, template):
@@ -439,7 +412,7 @@ def load_checkpoint(path, device=None):
     return out
 
 
-def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
+def predict_windows(envs, ckpt_template, device=None, clip_output=True):
     """
     Description:
         The body of forecast(envs): resolve this fold's checkpoint, read the
@@ -450,7 +423,12 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
         envs: evaluator settings dict, needs "path_to_test_x" and, under folds, "fold"
         ckpt_template: checkpoint path, optionally containing "{fold}"
         device: torch device string
-        clip_negative: clamp predictions at 0 (power cannot be negative)
+        clip_output: clamp predictions to [0, RATED_KW]. A turbine cannot
+                     produce negative power, and cannot exceed its rating -- so
+                     a forecast outside that range is not a forecast. Cheap
+                     insurance: it is worth almost nothing on the metric, which
+                     averages 38,592 predictions per window, but it stops the
+                     model emitting values that are physically impossible.
     Returns:
         float array (capacity, OUTPUT_LEN, 1) of predicted Patv in kW.
     """
@@ -487,8 +465,8 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
                 p = m(torch.from_numpy(xs).float().to(device)).cpu().numpy()
                 out[tid] = sc.inverse_target(p)[0]
 
-    if clip_negative:
-        out = np.clip(out, 0.0, None)
+    if clip_output:
+        out = np.clip(out, 0.0, RATED_KW)
     return out.reshape(capacity, OUTPUT_LEN, 1).astype(float)
 
 
@@ -522,19 +500,30 @@ def base_config(**overrides):
     cfg.update(overrides)
     return cfg
 # ===========================================================================
-# MODEL -- everything below this line is specific to gru_global.
+# MODEL -- everything below this line is specific to transformer.
 # ===========================================================================
 CKPT = os.environ.get(
-    "SDWPF_GRUG_CKPT",
-    os.path.join(_HERE, "checkpoints", "gru_global_{fold}.pt"))
+    "SDWPF_TST_CKPT",
+    os.path.join(_HERE, "checkpoints", "transformer_{fold}.pt"))
 
-LOOKBACK = 144          # 24 h -- the official baseline's input length
+LOOKBACK = 144          # pinned to the other neural baselines
 SCOPE = "global"        # "global" (1 model) or "per_turbine" (134 models)
-HIDDEN = 48             # official baseline value, confirmed by Team 88VIP
-LAYERS = 2              # official baseline value
-DROPOUT = 0.05          # official baseline value
-LOSS = "mse"            # official baseline uses nn.MSELoss
-CLIP_NEGATIVE = True
+
+# Steps glued into one token. 144 / PATCH_LEN = the number of tokens, so 24 -> 6
+# tokens of 4 hours each. PATCH_LEN = 1 recovers the vanilla per-timestep
+# transformer. THE ONLY SWEPT AXIS -- see the .md.
+PATCH_LEN = 24
+
+# Sized down from PatchTST (3+ blocks, width 128+) because ~200 days per fold
+# cannot support a large transformer. NOT swept -- see the .md for the caveat
+# that this model got far less tuning than the others.
+D_MODEL = 32            # width of each token vector
+N_HEADS = 2             # parallel attention patterns over the same tokens
+N_LAYERS = 1            # encoder blocks
+D_FF = 64               # feedforward width inside each block
+DROPOUT = 0.1
+LOSS = "mse"            # matches the GRU and the competition solutions
+CLIP_OUTPUT = True     # clamp to [0, RATED_KW]; see the .md
 
 
 def default_config(**overrides):
@@ -549,34 +538,71 @@ def default_config(**overrides):
     """
     cfg = base_config(
         lookback=LOOKBACK, scope=SCOPE, loss=LOSS,
-        hidden=HIDDEN, layers=LAYERS, dropout=DROPOUT,
-        lr=1e-4, batch_size=256, epochs=40, patience=8,
+        patch_len=PATCH_LEN, d_model=D_MODEL, n_heads=N_HEADS,
+        n_layers=N_LAYERS, d_ff=D_FF, dropout=DROPOUT,
+        lr=3e-4, batch_size=128, epochs=40, patience=8,
     )
     cfg.update(overrides)
     return cfg
 
 
-class GRUForecaster(nn.Module):
+class PositionalEncoding(nn.Module):
     """
     Description:
-        GRU encoder over the lookback window, flat linear head to the horizon.
+        Fixed sinusoidal position signal added to the token embeddings.
+        Attention is permutation-invariant on its own -- without this, shuffling
+        the tokens would change nothing, so the model could not tell yesterday's
+        patch from this morning's.
+    """
 
-        The head reads the final hidden state of the top layer. Emitting all
-        288 steps in one projection means errors never compound, unlike
-        step-by-step decoding.
+    def __init__(self, d_model, max_len=4096):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float()
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        if d_model > 1:
+            pe[:, 1::2] = torch.cos(pos * div)[:, :pe[:, 1::2].shape[1]]
+        self.register_buffer("pe", pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.shape[1]]
+
+
+class PatchTransformer(nn.Module):
+    """
+    Description:
+        Patch embedding -> positional encoding -> N encoder blocks -> flat head.
+
+        The encoder block is attention plus a small feedforward layer with
+        residual connections; it is where everything about token relationships
+        is learned. The flatten that follows is pure reshaping with no
+        parameters.
     """
 
     def __init__(self, cfg, n_in):
         super().__init__()
-        self.gru = nn.GRU(
-            input_size=n_in,
-            hidden_size=cfg["hidden"],
-            num_layers=cfg["layers"],
-            batch_first=True,
-            dropout=cfg["dropout"] if cfg["layers"] > 1 else 0.0,
-        )
+        self.patch_len = cfg["patch_len"]
+        steps = cfg["lookback"]
+        if steps % self.patch_len:
+            raise ValueError(
+                "lookback {} is not divisible by patch_len {}"
+                .format(steps, self.patch_len))
+        self.n_tokens = steps // self.patch_len
+
+        self.embed = nn.Linear(self.patch_len * n_in, cfg["d_model"])
+        self.pos = PositionalEncoding(cfg["d_model"])
         self.drop = nn.Dropout(cfg["dropout"])
-        self.head = nn.Linear(cfg["hidden"], OUTPUT_LEN)
+
+        block = nn.TransformerEncoderLayer(
+            d_model=cfg["d_model"], nhead=cfg["n_heads"],
+            dim_feedforward=cfg["d_ff"], dropout=cfg["dropout"],
+            activation="gelu", batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(
+            block, num_layers=cfg["n_layers"], enable_nested_tensor=False)
+
+        self.head = nn.Linear(cfg["d_model"] * self.n_tokens, OUTPUT_LEN)
 
     def forward(self, x):
         """
@@ -585,13 +611,16 @@ class GRUForecaster(nn.Module):
         Returns:
             (batch, OUTPUT_LEN) normalised Patv forecast.
         """
-        out, _ = self.gru(x)
-        return self.head(self.drop(out[:, -1]))
+        b, steps, ch = x.shape
+        tokens = x.reshape(b, self.n_tokens, self.patch_len * ch)
+        h = self.drop(self.pos(self.embed(tokens)))
+        h = self.encoder(h)
+        return self.head(h.reshape(b, -1))
 
 
 def build_model(cfg, n_in):
     """Factory used by the shared pipeline."""
-    return GRUForecaster(cfg, n_in)
+    return PatchTransformer(cfg, n_in)
 
 
 def train(train_csv=None, ckpt_path=None, device=None, verbose=True, **overrides):
@@ -622,12 +651,12 @@ def forecast(envs):
     Returns:
         float array (134, 288, 1) of predicted Patv in kW.
     """
-    return predict_windows(envs, CKPT, clip_negative=CLIP_NEGATIVE)
+    return predict_windows(envs, CKPT, clip_output=CLIP_OUTPUT)
 
 
 def main():
     """CLI: train one model."""
-    p = argparse.ArgumentParser(description="Train the gru_global baseline")
+    p = argparse.ArgumentParser(description="Train the transformer baseline")
     p.add_argument("--train-csv", type=str, default=None,
                    help="training CSV; under folds, that fold's fold_train.csv")
     p.add_argument("--ckpt", type=str, default=None,
@@ -636,8 +665,12 @@ def main():
                    choices=["global", "per_turbine"])
     p.add_argument("--lookback", type=int, default=None)
     p.add_argument("--loss", type=str, default=None, choices=["mse", "l1", "half"])
-    p.add_argument("--hidden", type=int, default=None)
-    p.add_argument("--layers", type=int, default=None)
+    p.add_argument("--patch-len", type=int, default=None,
+                   help="steps per token; 1 = vanilla per-timestep transformer")
+    p.add_argument("--d-model", type=int, default=None)
+    p.add_argument("--n-heads", type=int, default=None)
+    p.add_argument("--n-layers", type=int, default=None)
+    p.add_argument("--d-ff", type=int, default=None)
     p.add_argument("--dropout", type=float, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -648,7 +681,9 @@ def main():
 
     over = {k: v for k, v in [
         ("scope", a.scope), ("lookback", a.lookback), ("loss", a.loss),
-        ("hidden", a.hidden), ("layers", a.layers), ("dropout", a.dropout),
+        ("patch_len", a.patch_len), ("d_model", a.d_model),
+        ("n_heads", a.n_heads), ("n_layers", a.n_layers), ("d_ff", a.d_ff),
+        ("dropout", a.dropout),
         ("lr", a.lr), ("epochs", a.epochs), ("stride", a.stride),
         ("seed", a.seed)] if v is not None}
 
@@ -656,7 +691,7 @@ def main():
     if "{fold}" in ckpt:
         raise SystemExit(
             "--ckpt still contains '{fold}'. Training fits ONE fold at a time; "
-            "pass the resolved path, e.g. .../gru_global_F1.pt")
+            "pass the resolved path, e.g. .../transformer_F1.pt")
     train(train_csv=a.train_csv, ckpt_path=ckpt, device=a.device, **over)
 
 

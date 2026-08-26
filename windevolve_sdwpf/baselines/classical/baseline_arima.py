@@ -3,29 +3,29 @@
 path: windevolve_sdwpf/baselines/classical/baseline_arima.py
 
 Description:
-    Tier-1 fitted statistical baseline: a per-turbine, non-seasonal ARIMA.
-    134 independent models, one per turbine, each fitted to that turbine's Patv
-    series alone -- no wind speed, no time of day, no other turbines.
+    Per-turbine non-seasonal ARMA. 134 independent models, each fitted to that
+    turbine's Patv series alone -- no wind speed, no time of day, no neighbours.
 
-    Training and prediction are separate. Coefficients are estimated once,
-    offline, on the truncated training file. At prediction time they are held
-    FIXED while the Kalman filter is re-run over the window's recent history to
-    establish the current state, and the forecast is projected OUTPUT_LEN steps.
+    Fitting and prediction are separate. COEFFICIENTS are estimated once,
+    offline, from the last FIT_STEPS of the training file. At prediction time
+    they are held FIXED while the Kalman filter is re-run over the window's
+    recent history to establish the current STATE, and the forecast is then
+    projected OUTPUT_LEN steps. The warm-up is what lets coefficients fitted
+    months earlier forecast today.
 
-    DEFAULTS: order (1,0,1), fitted on the most recent 30 days. Both were chosen
-    by measurement on the 197/48 validation split; see docs/baseline_report.md
-    section 4.4. At 44.32 MW this is the best-scoring baseline in the suite --
-    better than a tuned GRU (44.54) and a tuned XGBoost (45.45), despite reading
-    one column where XGBoost reads nine.
+    Sweep results and the reasoning behind every default are in baseline_arima.md.
+
+Citation:
+    Contract and scoring follow the official Baidu KDD Cup 2022 SDWPF evaluator
+    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
+    Dataset: Zhou et al., arXiv:2208.04360 (2022).
 
 Example usage:
-    # Run from the package root (windevolve_sdwpf/):
-    # fit and save different orders to different files
-    python baselines/classical/baseline_arima.py --order 1,0,1 --fit-days 30 --model arma_101.joblib
-    python baselines/classical/baseline_arima.py --order 1,1,1 --fit-days 30 --model arima_111.joblib
+    python baselines/classical/baseline_arima.py --order 2,0,1 --fit-days 30 \
+        --model arma_201.joblib
 
-    # then score whichever you want by pointing the env var at it
-    SDWPF_ARIMA_MODEL=arma_101.joblib python evaluation/evaluator.py baselines/classical/baseline_arima.py
+    SDWPF_ARIMA_MODEL=arma_201.joblib \
+        python evaluation/evaluator.py baselines/classical/baseline_arima.py
 """
 import os                                  # paths and env vars
 import sys                                 # package-root discovery
@@ -43,39 +43,13 @@ OUTPUT_LEN = 288              # forecast horizon in 10-min steps (48h)
 DAY_LEN = 144                 # steps per day
 START_COL = 3                 # first modeled column (Wspd); Patv is the target
 
-# ARIMA order (p, d, q). The PACF shows a single sharp spike at lag 1 then
-# collapses into the noise band -- the AR(1) signature, so p=1 -- with no MA or
-# seasonal structure, so q small and non-seasonal.
-#
-# d=0, NOT d=1. An earlier reading of the slowly-decaying ACF suggested the
-# series was highly persistent and wanted differencing. That was wrong, and both
-# an ADF test (unit root rejected decisively) and the sweep agree:
-#
-#     (1,0,1)  44.976        (1,1,1)  56.631      +11.66 MW, roughly 30 sigma
-#     (1,0,0)  45.063        (1,1,0)  REJECTED    92.54% turbines near-identical
-#
-# Wind power oscillates around a stable mean rather than trending, so
-# differencing OVER-differences it; what remains behaves like a random walk,
-# whose multi-step forecast is a flat line -- which is why (1,1,0) trips the
-# official identical-prediction guard outright.
-#
-# Order beyond (1,0,1) buys nothing: (2,0,2) scores 44.883, a 0.09 MW difference
-# well inside the evaluation noise floor. Override with --order on the CLI.
-DEFAULT_ORDER = (1, 0, 1)
+# ARMA order (p, d, q). p = how many past VALUES feed the next step, q = how many
+# past SHOCKS. d = 0: wind power reverts to a stable mean rather than trending,
+# so differencing over-differences it. THE SWEPT AXIS. See the .md.
+DEFAULT_ORDER = (2, 0, 1)
 
-# Fit each turbine's model on the most recent FIT_STEPS of its training series.
-#
-# SHORTER IS BETTER, monotonically: 30 days 44.324, 90 days 44.681, 197 days
-# 44.976. The earlier assumption -- that stable AR(1) structure means more data
-# gives tighter estimates -- does not survive measurement. The dynamics drift
-# with season and weather regime, so old data is actively misleading rather than
-# merely redundant.
-#
-# Note this is the OPPOSITE of what climatology wants, where longer history wins
-# by 15 MW. The two models estimate different things: climatology estimates the
-# diurnal LEVEL profile, which is stable, while ARMA estimates the DYNAMICS,
-# which are not. Same data, opposite answers, and neither model alone would
-# reveal it.
+# Days of training history used to estimate the COEFFICIENTS, taken from the end
+# of the training prefix. THE SECOND SWEPT AXIS. See the .md.
 FIT_STEPS = 30 * DAY_LEN
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -117,20 +91,9 @@ def _resolve_path(envs, template):
             .format(template))
     return template.format(fold=fold)
 
-
-# When applying a fitted model to a window, only the most recent APPLY_STEPS of
-# the 2016-step history are re-filtered to seed the forecast.
-#
-# MEASURED: this has NO effect on the score at all. 144, 288, 432, 1008 and 2016
-# all return 44.9758 to four decimal places -- identical across a 14x range. The
-# exactness is the tell that it is structural: with coefficients frozen, a
-# STATIONARY ARMA's Kalman filter converges to steady state within a few dozen
-# steps and forgets its initial conditions, so earlier history cannot matter.
-# (A non-stationary model would not forget, which is a small extra confirmation
-# that d=0 is right.)
-#
-# Set to the shortest measured-equivalent value: one day. Purely an inference
-# speed lever -- raise it if a future change makes the state converge slower.
+# Warm-up steps replayed through the Kalman filter to set the STATE before
+# forecasting. REQUIRED but not tunable -- the filter converges within dozens of
+# steps, so length stops mattering. See the .md.
 APPLY_STEPS = 1 * DAY_LEN
 
 

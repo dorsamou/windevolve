@@ -2,48 +2,23 @@
 path: windevolve_sdwpf/baselines/mlp/mlp.py
 
 Description:
-    Multi-Layer Perceptron. Flatten the history window into one long vector,
-    push it through two hidden layers, read out all 288 horizon steps at once.
+    Multi-Layer Perceptron. Flattens the history window into one vector, pushes
+    it through two hidden layers, and reads out all 288 horizon steps at once.
+    Structure at the defaults: 1,440 inputs -> 512 -> 512 -> 288, about 1.15M
+    weights.
 
-    Structure at the defaults: 1,440 inputs -> 512 -> 512 -> 288 outputs.
-    One UNIT holds a weight for every input, multiplies, sums, adds a bias and
-    applies GELU. One LAYER is 512 such units, all seeing the same inputs but
-    each with its own weights. Weights: 0.74M + 0.26M + 0.15M = 1.15M.
+    Self-contained by design -- the whole pipeline is inlined so this file works
+    as a seed program for an evolve arm with nothing else on disk.
 
-    WHY IT IS IN THE SUITE. It is the control that isolates NONLINEARITY from
-    ARCHITECTURE. Climatology is linear with no time structure; the MLP is
-    nonlinear with no time structure; the GRU is nonlinear WITH time structure.
-    So GRU minus MLP is what the sequential inductive bias buys, and without
-    the MLP that effect is confounded with the nonlinearity.
-
-    THE WEAKNESS, stated plainly. Flattening means the network is never told
-    that input 1,439 is ten minutes old and input 4 is a day old -- it has to
-    learn that from data, spending weights on structure a GRU gets for free.
-
-    LOOKBACK IS PINNED AT 144. Same window as the GRU, LSTM and Transformer, so
-    that a difference between any two of them is a difference in architecture
-    and nothing else.
+    Sweep results, parameter meanings and caveats are in mlp.md.
 
 Citation:
-    Dataset: Zhou et al., arXiv:2208.04360 (2022);
-             Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
-    Contract and masking follow the official Baidu KDD Cup 2022 SDWPF evaluator
-    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/kddcup22-sdwpf-evaluation).
+    Dataset: Zhou et al., arXiv:2208.04360 (2022). Contract and masking follow
+    the official Baidu KDD Cup 2022 SDWPF evaluator (PaddlePaddle/PaddleSpatial).
 
 Example usage:
-    # from the package root (windevolve_sdwpf/)
-
-    # smoke test -- 2 epochs, throwaway checkpoint
     python baselines/mlp/mlp.py --epochs 2 --ckpt /tmp/mlp_smoke.pt
 
-    # train one model per fold
-    for F in F1 F2 F3 F4 F5; do
-      python baselines/mlp/mlp.py \
-          --train-csv evaluation/splits_rolling_5x30/$F/fold_train.csv \
-          --ckpt baselines/mlp/checkpoints/mlp_$F.pt
-    done
-
-    # score across all folds
     export SDWPF_MLP_CKPT="baselines/mlp/checkpoints/mlp_{fold}.pt"
     python evaluation/evaluator.py baselines/mlp/mlp.py \
         --folds-root evaluation/splits_rolling_5x30
@@ -87,6 +62,7 @@ START_COL = 3           # first modeled column (Wspd)
 N_FEATURES = 10         # Wspd Wdir Etmp Itmp Ndir Pab1 Pab2 Pab3 Prtv Patv
 PATV_IDX = 9            # index of Patv within the modeled columns -- the target
 MAX_LOOKBACK = 2016     # 14 days: what each window infile supplies
+RATED_KW = 1500.0       # a turbine's rated capacity -- the physical output ceiling
 
 
 def resolve_fold_path(envs, template):
@@ -428,7 +404,7 @@ def load_checkpoint(path, device=None):
     return out
 
 
-def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
+def predict_windows(envs, ckpt_template, device=None, clip_output=True):
     """
     Description:
         The body of forecast(envs): resolve this fold's checkpoint, read the
@@ -439,7 +415,12 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
         envs: evaluator settings dict, needs "path_to_test_x" and, under folds, "fold"
         ckpt_template: checkpoint path, optionally containing "{fold}"
         device: torch device string
-        clip_negative: clamp predictions at 0 (power cannot be negative)
+        clip_output: clamp predictions to [0, RATED_KW]. A turbine cannot
+                     produce negative power, and cannot exceed its rating -- so
+                     a forecast outside that range is not a forecast. Cheap
+                     insurance: it is worth almost nothing on the metric, which
+                     averages 38,592 predictions per window, but it stops the
+                     model emitting values that are physically impossible.
     Returns:
         float array (capacity, OUTPUT_LEN, 1) of predicted Patv in kW.
     """
@@ -476,8 +457,8 @@ def predict_windows(envs, ckpt_template, device=None, clip_negative=True):
                 p = m(torch.from_numpy(xs).float().to(device)).cpu().numpy()
                 out[tid] = sc.inverse_target(p)[0]
 
-    if clip_negative:
-        out = np.clip(out, 0.0, None)
+    if clip_output:
+        out = np.clip(out, 0.0, RATED_KW)
     return out.reshape(capacity, OUTPUT_LEN, 1).astype(float)
 
 
@@ -518,13 +499,16 @@ CKPT = os.environ.get(
     os.path.join(_HERE, "checkpoints", "mlp_{fold}.pt"))
 
 LOOKBACK = 144          # history steps flattened into the input vector
-SCOPE = "global"        # "global" (1 model) or "per_turbine" (134 models)
+SCOPE = "global"        # NOT the champion. per_turbine scored better (45.409 vs
+                        # 46.598) but trains 134 models per fold, which is ~134x
+                        # the cost -- prohibitive for an evolve arm evaluating
+                        # many candidates. See mlp.md.
 HIDDEN = 512            # units per hidden layer
 DEPTH = 2               # hidden layers
 ACTIVATION = "gelu"     # "relu" / "gelu" / "tanh"
 DROPOUT = 0.1           # units zeroed at random per training step
 LOSS = "mse"            # matches the official GRU baseline
-CLIP_NEGATIVE = True
+CLIP_OUTPUT = True     # clamp to [0, RATED_KW]; see the .md
 
 
 def default_config(**overrides):
@@ -616,7 +600,7 @@ def forecast(envs):
     Returns:
         float array (134, 288, 1) of predicted Patv in kW.
     """
-    return predict_windows(envs, CKPT, clip_negative=CLIP_NEGATIVE)
+    return predict_windows(envs, CKPT, clip_output=CLIP_OUTPUT)
 
 
 def main():

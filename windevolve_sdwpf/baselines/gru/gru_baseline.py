@@ -1,108 +1,100 @@
-# -*- coding: utf-8 -*-
 """
-path: windevolve_sdwpf/baseline_models/gru/gru_baseline.py
+path: windevolve_sdwpf/baselines/gru/gru_baseline.py
 
 Description:
-    Single-file PyTorch port of the official Baidu KDD Cup 2022 SDWPF GRU
-    baseline: ONE independent GRU per turbine (134 models). Contains everything
-    needed to train the baseline and to score it through evaluator.py:
-      * Scaler          -- the baseline's normalizer (global scalar mean/std)
-      * TurbineWindowDataset / build_turbine_splits -- per-turbine 214/31 splits
-      * BaselineGruModel -- GRU(10->48) x2 + dropout + Linear(48->1)
-      * train_one_turbine / main() -- the official training recipe + CLI
-      * forecast(envs)  -- the program contract, so evaluator.py can score it
+    Gated Recurrent Unit
+
+    Walks the window one step at a time carrying a HIDDEN hidden-state summary,
+    then emits all 288 horizon steps in one projection from the final state.
+    Emitting the horizon in one shot rather than decoding step by step means
+    errors never compound.
+
+    Two gates per step, both sigmoid so they output a FRACTION in (0,1):
+    update (how much of the old summary to keep) and reset (how much of it to
+    use when forming the candidate). The candidate itself is tanh, because it is
+    signed content rather than a fraction.
+
+    Self-contained by design -- the whole pipeline is inlined so this file works
+    as a seed program for an evolve arm with nothing else on disk.
+
+    Sweep results and the reasoning behind every default are in
+    gru_baseline.md.
 
 Citation:
-    Port of PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru/
-    ({model,train,common,wind_turbine_data}.py and the submission predict.py in
-    kddcup22-sdwpf-evaluation/paddlepaddle/tests)
-    https://github.com/PaddlePaddle/PaddleSpatial  (accessed 2026-07-22)
-    Dataset: Zhou et al., arXiv:2208.04360 (2022);
-             Scientific Data 11:649 (2024), doi:10.1038/s41597-024-03427-5.
+    The GRU cell: Cho et al., "On the Properties of Neural Machine Translation",
+    SSST-8, 2014.
+    Layers, dropout and learning rate come from the official SDWPF GRU baseline
+    (PaddlePaddle/PaddleSpatial, apps/wpf_baseline_gru). Team 88VIP published the
+    same values independently after their own tuning (Lin et al.,
+    arXiv:2208.08952, Table 3)
+    The dataset: Zhou et al., arXiv:2208.04360 (2022).
 
 Example usage:
-    # Run from the package root (windevolve_sdwpf/):
-    # 1. Smoke-test that it runs (3 turbines, 1 epoch, throwaway folder):
-    python baseline_models/gru/gru_baseline.py \
-        --turbines 0-2 --epochs 1 --checkpoints /tmp/gru_smoke
-    # 2. The real run -- all 134 turbines, one pass, one seed:
-    python baseline_models/gru/gru_baseline.py --device cuda
-    # 3. Score it. Inference is stochastic, so take several draws:
-    for s in 1 2 3 4 5; do
-      SDWPF_GRU_INFER_SEED=$s python evaluator.py baseline_models/gru/gru_baseline.py
+    python baselines/gru/gru_baseline.py --epochs 2 --ckpt /tmp/gru.pt
+
+    for F in F1 F2 F3 F4 F5; do
+      python baselines/gru/gru_baseline.py \
+          --train-csv evaluation/splits_rolling_5x30/$F/fold_train.csv \
+          --ckpt baselines/gru/checkpoints/gru_$F.pt
     done
+
+    export SDWPF_GRU_CKPT="baselines/gru/checkpoints/gru_{fold}.pt"
+    python evaluation/evaluator.py baselines/gru/gru_baseline.py \
+        --folds-root evaluation/splits_rolling_5x30
 """
-import os                                    # checkpoint paths, env vars
+import os                                    # paths, env vars
 import sys                                   # package-root discovery
 import time                                  # timing
-import argparse                              # training CLI
 import random                                # seeding
+import argparse                              # training CLI
 
 import numpy as np                           # array math
 import pandas as pd                          # CSV reading
-import torch                                 # model + training
+import torch                                 # tensors
 import torch.nn as nn                        # layers and loss
 from torch.utils.data import Dataset, DataLoader
 
-# baselines/gru/ -> baselines/ -> repo root. Add the repo root (paths.py) and
-# evaluation/ (test_data.py) so imports work whether this file is run directly
-# or loaded by path from the evaluator.
+# baselines/<model>/ -> baselines/ -> repo root. Added so this file works when
+# run directly, when imported by the sweep harness, when loaded by
+# evaluator.py, and when handed to an evolve arm.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(os.path.dirname(_HERE))
 for _p in (_ROOT, os.path.join(_ROOT, "evaluation")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from test_data import TestData               # official per-turbine window loader
+from test_data import TestData               # official per-window loader
 from paths import VAL_TRAIN_FILE
 
-DAY_LEN = 144        # 10-minute observations per day
-START_COL = 3        # first modeled column (Wspd); 0-2 are TurbID/Day/Tmstamp
+# ===========================================================================
+# SHARED PIPELINE -- data, scaler, windowing, training, inference.
+#
+# Duplicated verbatim across mlp.py / lstm.py / transformer.py / gru_baseline.py
+# a complete, independently-evolvable program. Keep the copies in sync by hand;
+# a divergence here silently makes their scores incomparable.
+# ===========================================================================
 
-# Default location of the 245-day training CSV (override with --data).
-# The TRUNCATED training csv (pre-validation rows only). Never the full 245
-# days -- that would train on the validation targets this model is scored on.
-DEFAULT_TRAIN_CSV = VAL_TRAIN_FILE
+CAPACITY = 134          # turbines in the farm
+DAY_LEN = 144           # 10-minute observations per day
+OUTPUT_LEN = 288        # forecast horizon (48h) -- immutable
+START_COL = 3           # first modeled column (Wspd)
+N_FEATURES = 10         # Wspd Wdir Etmp Itmp Ndir Pab1 Pab2 Pab3 Prtv Patv
+PATV_IDX = 9            # index of Patv within the modeled columns -- the target
+MAX_LOOKBACK = 2016     # 14 days: what each window infile supplies
+RATED_KW = 1500.0       # a turbine's rated capacity -- the physical output ceiling
 
-# The official global seed, set ONCE before the turbine loop
-# (common.py / train.py: fix_seed = 3407).
-# Base training seed. The official value is 3407. Per-turbine seeding uses
-# OFFICIAL_FIX_SEED + tid, so changing this shifts every turbine's seed together
-# and gives an independent training run -- which is what a noise-floor
-# measurement needs. Override with SDWPF_GRU_SEED or --seed.
-OFFICIAL_FIX_SEED = int(os.environ.get("SDWPF_GRU_SEED", "3407"))
 
-# Folder holding model_0.pt ... model_133.pt (written by training, read by forecast).
-CHECKPOINTS = os.environ.get("SDWPF_GRU_CHECKPOINTS", os.path.join(_HERE, "checkpoints"))
-
-# Optional seed for inference. The official predict.py seeds nothing, so its
-# forecasts are irreproducible run to run; set this to make a given run
-# repeatable while keeping the dropout noise that the official code has.
-INFER_SEED = os.environ.get("SDWPF_GRU_INFER_SEED")
-
-# Keep dropout ACTIVE at inference, as the official predict.py does. False (the
-# default) calls model.eval(), so forecast() is deterministic. Set True only to
-# reproduce the published baseline's stochastic behaviour.
-INFER_DROPOUT = os.environ.get("SDWPF_GRU_INFER_DROPOUT", "").lower() in ("1", "true", "yes")
-
-# Clip negative predictions to zero. False matches the official baseline.
-CLIP_NEGATIVE = False
-
-# Module-level cache: models load once and are reused across all 142 windows.
-_CACHE = {"models": None, "scalers": None, "settings": None,
-          "device": None, "path": None}
-
-def _resolve_path(envs, template):
+def resolve_fold_path(envs, template):
     """
     Description:
-        Resolve a checkpoint directory, substituting "{fold}" when the evaluator
-        supplies a fold name in envs. This is what lets ONE process score every
-        fold of a cross-validation layout: without it the directory is fixed at
-        import time and all five folds would silently load the same weights --
-        which is a leak, not a score.
+        Fill "{fold}" in a checkpoint path from envs. Under a rolling-origin
+        layout each fold trains on its own prefix, so each fold needs its own
+        weights. A path without the placeholder scored across folds would load
+        one model for all five -- four of which trained on their own validation
+        targets. That is a leak, so this raises instead.
     Args:
-        envs: the settings dict passed to forecast() (may be None)
-        template: the configured path, optionally containing "{fold}"
+        envs: settings dict passed to forecast() (may be None)
+        template: configured path, optionally containing "{fold}"
     Returns:
         The resolved filesystem path.
     """
@@ -117,952 +109,544 @@ def _resolve_path(envs, template):
     return template.format(fold=fold)
 
 
-
-def default_settings():
+def load_farm_array(path, capacity=CAPACITY, start_col=START_COL):
     """
     Description:
-        The official baseline hyperparameters for the 245-day KDD Cup file.
+        Read a training CSV into a per-turbine array. NaN becomes 0, matching
+        test_data.TestData, so training inputs and scoring inputs are treated
+        identically -- a mismatch there is train/serve skew no hyperparameter
+        can fix.
     Args:
-        None
+        path: CSV path, turbine-major
+        capacity: turbines stacked in the file
+        start_col: index of the first modeled column
     Returns:
-        A settings dict consumed by the model, data pipeline, and trainer.
+        float32 array (capacity, steps_per_turbine, n_features).
     """
-    return {
-        "task": "MS",             # multivariate in, single variable out
-        "target": "Patv",         # predicted variable
-        "input_len": 144,         # history window fed to the GRU (1 day)
-        "output_len": 288,        # forecast horizon (48h)
-        "start_col": START_COL,   # first modeled column (Wspd)
-        "in_var": 10,             # modeled input variables
-        "out_var": 1,             # outputs (Patv)
-        "day_len": DAY_LEN,       # observations per day
-        "train_size": 214,        # training days (official 245-day split)
-        "val_size": 31,           # validation days
-        "total_size": 245,        # days per turbine in the file
-        # NOTE: train_size/val_size/total_size describe the FILE passed to
-        # --data, not the competition's 245-day file specifically. total_size in
-        # particular is the per-turbine STRIDE used to index the flat array in
-        # build_turbine_splits(); if it disagrees with the file, every turbine
-        # after the first is read from the wrong offset and training silently
-        # trains on another turbine's data. main() therefore overrides all three
-        # from the file's actual length -- see resolve_day_sizes().
-        "lstm_layer": 2,          # GRU layers (official: 2; 1 differs by 0.018 MW)
-        "hidden": 48,             # GRU hidden size (official: 48) -- see note below
-        "dropout": 0.05,          # dropout before the projection
-        "capacity": 134,          # turbines
-        "batch_size": 32,         # minibatch size
-        "clip_norm": 50.0,        # gradient norm bound
-        "lr": 1e-4,               # Adam learning rate (official: 1e-4)
-
-        # ------------------------------------------------------------------
-        # TRAINING BUDGET AND SCHEDULE. These three differ from the official
-        # values (10 epochs, patience 3, decay 0.5) and are the best MEASURED
-        # configuration on the 197/48 validation split, at 44.537 MW against
-        # 45.136 for the official settings. See docs/baseline_report.md 4.6.
-        #
-        # The official schedule was the binding constraint, not the learning
-        # rate or the architecture. lr=1e-4 halved every epoch is ~1/500th of
-        # its starting value by epoch 10, so the model stopped improving long
-        # before it converged:
-        #
-        #   lr=3e-4, decay 0.5          44.642
-        #   lr=1e-3, decay 0.5          44.667
-        #   lr=1e-4, NO decay           44.604   <- rate was never the problem
-        #   40 epochs, patience 8,
-        #     decay 0.9                 44.537   <- adopted
-        #
-        # Every optimiser variant gains ~0.5 MW over the official settings, and
-        # the best of them keeps the official learning rate and only relaxes the
-        # schedule.
-        # ------------------------------------------------------------------
-        "train_epochs": 40,       # max epochs per turbine (official: 10)
-        "patience": 8,            # early-stopping patience (official: 3)
-        "lr_decay": 0.9,          # per-epoch multiplier (official: 0.5)
-
-        # NOT ADOPTED, though it scored better in isolation: hidden=128 gave
-        # 44.745 against 45.136 for hidden=48, monotonic in 48 -> 96 -> 128 and
-        # still improving at the edge of the swept range. It was measured under
-        # the OFFICIAL optimiser schedule, so combining it with the budget above
-        # is an extrapolation no sweep point tested. Raising capacity and
-        # re-measuring is an open item; until then the default is the
-        # configuration that was actually scored at 44.537.
-        #
-        # Also measured and NOT adopted: input_len. 144 -> 288 -> 432 moves the
-        # score by 0.043 MW in total, the smallest effect in the entire study.
-        # Reading 24h to forecast 48h is not the binding constraint.
-
-        # ------------------------------------------------------------------
-        # TRAINING-LOOP CORRECTNESS. The official Baidu code has four real
-        # defects (gru_baseline.md section 6). This project's GRU is a
-        # comparator for the evolutionary search and a candidate seed program,
-        # not a reproduction of a published number -- so the defaults below are
-        # the CORRECT behaviour, and the official behaviour is opt-in via
-        # --official (or settings["official_loop"]).
-        #
-        #   zero_grad    True  = zero the gradient buffer each step. The
-        #                official train.py never calls clear_grad(), so its
-        #                gradients accumulate across every batch AND epoch --
-        #                by batch n the applied gradient is the sum of all n
-        #                preceding ones. This is the worst of the four.
-        #   double_step  False = one Adam application per batch. The official
-        #                gets two (paddle's minimize() updates, then step()).
-        #   global_clip  True  = clip the global gradient norm, PyTorch's usual
-        #                rule. The official clips each parameter separately.
-        #   eval_val     True  = dropout off while measuring validation loss,
-        #                so early stopping reads signal rather than noise.
-        #   shuffle_val  False = measure the same validation windows every
-        #                epoch. The official shuffles with drop_last, discarding
-        #                a different random subset each time.
-        #   per_turbine_seed True = seed from OFFICIAL_FIX_SEED + tid inside
-        #                each turbine. The official seeds ONCE before the loop,
-        #                which makes turbine 100's weights depend on turbines
-        #                0-99 having drawn first -- so a partial run is not
-        #                reproducible and turbines cannot be trained in
-        #                parallel. Per-turbine seeding fixes both, and is what
-        #                makes --turbines sharding valid.
-        # ------------------------------------------------------------------
-        "zero_grad": True,
-        "double_step": False,
-        "global_clip": True,
-        "eval_val": True,
-        "shuffle_val": False,
-        "per_turbine_seed": True,
-    }
+    df = pd.read_csv(path)
+    if df.shape[0] % capacity:
+        raise ValueError("{} has {} rows, not divisible by capacity {}"
+                         .format(path, df.shape[0], capacity))
+    steps = df.shape[0] // capacity
+    arr = df[df.columns[start_col:]].replace(np.nan, 0).values.astype(np.float32)
+    return arr.reshape(capacity, steps, -1)
 
 
 class Scaler(object):
     """
     Description:
-        The baseline's normalizer. Uses one GLOBAL scalar mean and std over all
-        elements of the fitted array (not per-column), matching the original.
+        Per-feature standardiser. Fitted across all turbines for scope=global
+        so the same physical wind speed means the same thing everywhere, and
+        per turbine for scope=per_turbine.
+
+        Always fitted on the TRAINING PREFIX ONLY -- fitting on the whole file
+        would leak the validation period's distribution into the normaliser.
     """
 
-    def __init__(self, mean=0.0, std=1.0):
-        """
-        Description:
-            Initialize with optional pre-computed statistics.
-        Args:
-            mean: scalar mean (0.0 until fit)
-            std: scalar standard deviation (1.0 until fit)
-        Returns:
-            None
-        """
-        self.mean = mean        # scalar mean over all fitted elements
-        self.std = std          # scalar std over all fitted elements
+    def __init__(self):
+        self.mean = None
+        self.std = None
 
-    def fit(self, data):
-        """
-        Description:
-            Compute the global scalar mean/std over the whole array.
-        Args:
-            data: 2-D array of the modeled columns for the training split
-        Returns:
-            None
-        """
-        self.mean = float(np.mean(data))
-        self.std = float(np.std(data))
+    def fit(self, arr):
+        """Fit on (turbines, steps, features) or (steps, features)."""
+        flat = arr.reshape(-1, arr.shape[-1])
+        self.mean = flat.mean(axis=0)
+        std = flat.std(axis=0)
+        self.std = np.where(std < 1e-6, 1.0, std)   # guard constant columns
+        return self
 
-    def transform(self, data):
-        """
-        Description:
-            Normalize using the fitted global statistics.
-        Args:
-            data: array to normalize
-        Returns:
-            The normalized array.
-        """
-        return (data - self.mean) / self.std
+    def transform(self, arr):
+        return (arr - self.mean) / self.std
 
-    def inverse_transform(self, data):
-        """
-        Description:
-            Undo the normalization, returning values to kW.
-        Args:
-            data: normalized array (e.g. model output)
-        Returns:
-            The de-normalized array.
-        """
-        return (data * self.std) + self.mean
+    def inverse_target(self, y):
+        """Undo normalisation for the Patv channel only, returning kW."""
+        return y * self.std[PATV_IDX] + self.mean[PATV_IDX]
+
+    def state(self):
+        return {"mean": np.asarray(self.mean), "std": np.asarray(self.std)}
+
+    @classmethod
+    def from_state(cls, st):
+        s = cls()
+        s.mean, s.std = np.asarray(st["mean"]), np.asarray(st["std"])
+        return s
 
 
-def load_modeled_columns(path, start_col=START_COL):
+class WindowDataset(Dataset):
     """
     Description:
-        Read the 245-day training CSV and return only the modeled columns, with
-        NaNs replaced by 0 (as the baseline does before scaling).
-    Args:
-        path: path to sdwpf_245days_v1.csv
-        start_col: index of the first modeled column (3 -> Wspd)
-    Returns:
-        A float array of shape (n_rows, n_modeled_cols), rows turbine-major.
-    """
-    df = pd.read_csv(path)
-    df_data = df[df.columns[start_col:]]
-    df_data = df_data.replace(to_replace=np.nan, value=0)
-    return df_data.values.astype(np.float32)
+        (lookback, horizon) pairs. With turbines=None it pools every turbine
+        (scope=global); with a single turbine index it yields that turbine only
+        (scope=per_turbine).
 
-
-class TurbineWindowDataset(Dataset):
-    """
-    Description:
-        Rolling-window dataset over one turbine's split. Each item is an
-        input_len-step input window and the following output_len-step target
-        window (all modeled columns; the target column is selected at loss time).
+        STRIDE keeps every Nth forecast origin. Consecutive origins differ by
+        one 10-minute step and are almost the same example, so this is an
+        epoch-size knob rather than an accuracy knob.
     """
 
-    def __init__(self, data, input_len, output_len):
-        """
-        Description:
-            Wrap an already-scaled 2-D array for one turbine split.
-        Args:
-            data: scaled array of shape (n_steps, n_features) for this split
-            input_len: history window length (144)
-            output_len: forecast horizon (288)
-        Returns:
-            None
-        """
-        self.data = data                # scaled split for this turbine
-        self.input_len = input_len      # input window length
-        self.output_len = output_len    # forecast horizon
+    def __init__(self, arr, lookback, stride=6, turbine=None):
+        self.arr = arr
+        self.lookback = lookback
+        n_turb, steps, _ = arr.shape
+        last_origin = steps - OUTPUT_LEN
+        starts = np.arange(lookback, last_origin, stride)
+        if starts.size == 0:
+            raise ValueError(
+                "lookback {} + horizon {} does not fit in {} steps"
+                .format(lookback, OUTPUT_LEN, steps))
+        tids = range(n_turb) if turbine is None else [turbine]
+        self.index = [(t, int(s)) for t in tids for s in starts]
 
     def __len__(self):
-        """
-        Description:
-            Number of complete (input, target) windows in this split.
-        Args:
-            None
-        Returns:
-            The window count as an int.
-        """
-        return len(self.data) - self.input_len - self.output_len + 1
+        return len(self.index)
 
-    def __getitem__(self, index):
-        """
-        Description:
-            Return one rolling window pair starting at `index`.
-        Args:
-            index: window start position
-        Returns:
-            A tuple (seq_x, seq_y) shaped (input_len, n_features) and
-            (output_len, n_features).
-        """
-        s_begin = index
-        s_end = s_begin + self.input_len
-        r_begin = s_end
-        r_end = r_begin + self.output_len
-        return self.data[s_begin:s_end], self.data[r_begin:r_end]
+    def __getitem__(self, i):
+        tid, origin = self.index[i]
+        x = self.arr[tid, origin - self.lookback:origin]           # (L, F)
+        y = self.arr[tid, origin:origin + OUTPUT_LEN, PATV_IDX]    # (H,)
+        return (torch.from_numpy(np.ascontiguousarray(x)).float(),
+                torch.from_numpy(np.ascontiguousarray(y)).float())
 
 
-def build_turbine_splits(data, tid, settings):
+def split_prefix(arr, val_days):
     """
     Description:
-        Build this turbine's train/validation datasets and its fitted Scaler,
-        using the baseline's border arithmetic. The scaler is fit on the
-        turbine's training rows only, then applied to both splits. The
-        validation split starts input_len steps early so its first window has a
-        full history, exactly as in the original.
+        Carve an INNER validation tail off the training prefix, used only for
+        early stopping. This is NOT the project's validation split -- that one
+        lives in the fold directories and is never touched here. Two levels of
+        holdout is the point: early stopping on the scored fold would tune the
+        model on the data it is about to be measured on.
     Args:
-        data: the full modeled-columns array from load_modeled_columns()
-        tid: turbine index in [0, capacity)
-        settings: dict with input_len, output_len, day_len, train_size (days),
-                  val_size (days), total_size (days)
+        arr: (capacity, steps, n_features)
+        val_days: days reserved at the end for early stopping
     Returns:
-        A tuple (train_ds, val_ds, scaler).
+        (train_arr, inner_val_arr)
     """
-    unit = settings["day_len"]                      # steps per day (144)
-    total_size = settings["total_size"] * unit      # steps per turbine (245 days)
-    train_size = settings["train_size"] * unit      # training steps (214 days)
-    val_size = settings["val_size"] * unit          # validation steps (31 days)
-    input_len = settings["input_len"]
-    output_len = settings["output_len"]
-
-    # Border arithmetic from the official loader (index 0 = train, 1 = val).
-    border1s = [tid * total_size,
-                tid * total_size + train_size - input_len]
-    border2s = [tid * total_size + train_size,
-                tid * total_size + train_size + val_size]
-
-    # Fit the scaler on this turbine's TRAIN rows only.
-    scaler = Scaler()
-    scaler.fit(data[border1s[0]:border2s[0]])
-
-    train_arr = scaler.transform(data[border1s[0]:border2s[0]])
-    val_arr = scaler.transform(data[border1s[1]:border2s[1]])
-    return (TurbineWindowDataset(train_arr, input_len, output_len),
-            TurbineWindowDataset(val_arr, input_len, output_len),
-            scaler)
+    steps = arr.shape[1]
+    cut = steps - val_days * DAY_LEN
+    if cut <= 0:
+        raise ValueError("val_days {} exceeds the {} steps available"
+                         .format(val_days, steps))
+    return arr[:, :cut], arr[:, cut:]
 
 
-class BaselineGruModel(nn.Module):
+def seed_everything(seed):
+    """Seed python, numpy and torch from one integer."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def make_loss(name):
+    """MSE by default -- it is what the official GRU baseline and the
+    competition solutions use. 'half' is 0.5*MSE + 0.5*L1, the objective
+    matched to the competition's own 0.5*(MAE + RMSE) score."""
+    if name == "mse":
+        return nn.MSELoss()
+    if name == "l1":
+        return nn.L1Loss()
+    if name == "half":
+        mse, l1 = nn.MSELoss(), nn.L1Loss()
+        return lambda p, t: 0.5 * mse(p, t) + 0.5 * l1(p, t)
+    raise ValueError("unknown loss {!r}".format(name))
+
+
+def _fit_one(cfg, train_arr, inner_arr, n_in, device, turbine, verbose):
     """
     Description:
-        The official SDWPF GRU baseline: GRU(in_var -> 48) x lstm_layer, dropout,
-        then a linear projection to out_var, emitting the final output_len steps.
-        The original used a time_major GRU with explicit transposes, which is
-        equivalent to batch_first=True here.
+        Train a single model -- either the one global model, or one turbine's
+        model when scope=per_turbine. Returns (state_dict, best_inner_loss).
     """
+    ds_tr = WindowDataset(train_arr, cfg["lookback"], cfg["stride"], turbine)
+    ds_va = WindowDataset(inner_arr, cfg["lookback"],
+                          max(1, cfg["stride"] // 2), turbine)
+    # drop_last only when there is more than one full batch. With
+    # scope=per_turbine a single turbine can yield fewer windows than the batch
+    # size, and drop_last would then silently produce ZERO batches -- the model
+    # would "train" without a single gradient step and score as noise.
+    dl_tr = DataLoader(ds_tr, batch_size=cfg["batch_size"], shuffle=True,
+                       num_workers=cfg["num_workers"],
+                       drop_last=len(ds_tr) > cfg["batch_size"])
+    dl_va = DataLoader(ds_va, batch_size=cfg["batch_size"], shuffle=False,
+                       num_workers=cfg["num_workers"])
 
-    def __init__(self, settings):
-        """
-        Description:
-            Build the GRU baseline from the settings dict.
-        Args:
-            settings: dict with "output_len", "in_var", "out_var", "dropout",
-                      and "lstm_layer"
-        Returns:
-            None
-        """
-        super(BaselineGruModel, self).__init__()
-        self.output_len = settings["output_len"]      # forecast horizon (288)
-        self.hidC = settings["in_var"]                # input feature count (10)
-        self.hidR = settings.get("hidden", 48)        # GRU hidden size (official 48)
-        self.out = settings["out_var"]                # output variables (1 = Patv)
-        self.dropout = nn.Dropout(settings["dropout"])
-        self.lstm = nn.GRU(input_size=self.hidC, hidden_size=self.hidR,
-                           num_layers=settings["lstm_layer"], batch_first=True)
-        self.projection = nn.Linear(self.hidR, self.out)
+    model = build_model(cfg, n_in).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=cfg["lr_decay"])
+    loss_fn = make_loss(cfg["loss"])
 
-        # Deviation 6: paddle's nn.Linear defaults to XavierNormal weights and a
-        # ZERO bias; PyTorch defaults to U(+/-1/sqrt(fan_in)) for both. Measured
-        # on paddle 3.3.1: Linear(48,512) weight std 0.05944 vs XavierNormal's
-        # sqrt(2/(48+512)) = 0.05976, bias all-zero.
-        # The GRU's own init already matches across frameworks -- both use
-        # U(+/-1/sqrt(hidden)), verified -- so it is deliberately left alone.
-        nn.init.xavier_normal_(self.projection.weight)
-        nn.init.zeros_(self.projection.bias)
-
-    def forward(self, x_enc):
-        """
-        Description:
-            Pad the input with output_len zero steps, run the GRU over the padded
-            sequence, project, and return the final output_len steps.
-        Args:
-            x_enc: input tensor of shape (batch, input_len, in_var), normalized
-        Returns:
-            A tensor of shape (batch, output_len, out_var).
-        """
-        x = torch.zeros(x_enc.shape[0], self.output_len, x_enc.shape[2],
-                        dtype=x_enc.dtype, device=x_enc.device)
-        x_enc = torch.cat((x_enc, x), dim=1)          # (B, input_len+output_len, C)
-        dec, _ = self.lstm(x_enc)                     # (B, T, hidR)
-        sample = self.projection(self.dropout(dec))   # (B, T, out)
-        return sample[:, -self.output_len:, -self.out:]
-
-
-def resolve_day_sizes(data, settings, train_days=None, val_days=None):
-    """
-    Description:
-        Derive total_size / train_size / val_size (all in DAYS) from the file
-        that was actually loaded, rather than trusting the 245-day defaults.
-
-        This exists because total_size doubles as the per-turbine stride in
-        build_turbine_splits(). Training on the truncated 196-day val_train.csv
-        with total_size still at 245 would index turbine t at step t*35280 in an
-        array that only has t*28224 per turbine -- every turbine but the first
-        would be fitted on a misaligned slice of somebody else's series, and
-        nothing would raise.
-
-        The inner train/val boundary is the split used for EARLY STOPPING only.
-        It is carved out of the file it is given, so when that file is
-        val_train.csv the early-stopping signal never touches the held-out
-        validation period. By default the official 214:245 proportion is
-        preserved (196 days -> 171 train / 25 early-stopping), which keeps the
-        recipe unchanged apart from having less data.
-
-    Args:
-        data: the modeled-columns array from load_modeled_columns()
-        settings: settings dict to update in place
-        train_days: explicit inner-training days (None -> official proportion)
-        val_days: explicit inner-validation days (None -> the remainder)
-    Returns:
-        The updated settings dict.
-    """
-    unit = settings["day_len"]
-    capacity = settings["capacity"]
-
-    rows = data.shape[0]
-    if rows % capacity != 0:
+    if len(ds_tr) == 0:
         raise ValueError(
-            "file has {} rows, not divisible by capacity {} -- turbines must "
-            "have equal-length blocks".format(rows, capacity))
-    steps = rows // capacity
-    if steps % unit != 0:
-        raise ValueError(
-            "file has {} steps per turbine, not a whole number of {}-step "
-            "days".format(steps, unit))
-    total_days = steps // unit
+            "no training windows: lookback {} + horizon {} does not fit the "
+            "available history at stride {}".format(
+                cfg["lookback"], OUTPUT_LEN, cfg["stride"]))
 
-    if train_days is None and val_days is None:
-        # Preserve the official 214/245 proportion on whatever length we got.
-        train_days = int(round(total_days * 214.0 / 245.0))
-        val_days = total_days - train_days
-    elif val_days is None:
-        val_days = total_days - train_days
-    elif train_days is None:
-        train_days = total_days - val_days
-
-    if train_days <= 0 or val_days <= 0:
-        raise ValueError("train_days={} val_days={} -- both must be positive".format(
-            train_days, val_days))
-    if train_days + val_days != total_days:
-        raise ValueError(
-            "train_days ({}) + val_days ({}) = {} does not equal the file's "
-            "{} days; the borders would leave a gap or overrun".format(
-                train_days, val_days, train_days + val_days, total_days))
-
-    # Each split must hold at least one complete (input, target) window.
-    need = settings["input_len"] + settings["output_len"]
-    if train_days * unit < need:
-        raise ValueError("inner-train split ({} steps) is shorter than one "
-                         "window ({} steps)".format(train_days * unit, need))
-    # The val split starts input_len steps early, so it needs output_len more.
-    if val_days * unit + settings["input_len"] < need:
-        raise ValueError("inner-val split ({} steps) is shorter than one "
-                         "window ({} steps)".format(val_days * unit, need))
-
-    settings["total_size"] = total_days
-    settings["train_size"] = train_days
-    settings["val_size"] = val_days
-    return settings
-
-
-def pick_device(requested=None):
-    """
-    Description:
-        Choose the compute device, preferring an explicit request and otherwise
-        falling back through CUDA and Apple MPS to CPU.
-    Args:
-        requested: "cuda", "mps", "cpu", or None for auto-detection
-    Returns:
-        A torch.device.
-    """
-    if requested:
-        return torch.device(requested)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def parse_turbines(spec, capacity):
-    """
-    Description:
-        Parse a turbine selection string into a list of turbine indices.
-    Args:
-        spec: e.g. "0-133", "0-9", or "0,5,7" (None -> all turbines)
-        capacity: total number of turbines (134)
-    Returns:
-        A sorted list of turbine indices.
-    """
-    if not spec:
-        return list(range(capacity))
-    ids = []
-    for part in spec.split(","):
-        part = part.strip()
-        if "-" in part:
-            lo, hi = part.split("-")
-            ids.extend(range(int(lo), int(hi) + 1))
-        else:
-            ids.append(int(part))
-    return sorted(i for i in ids if 0 <= i < capacity)
-
-
-def adjust_learning_rate(optimizer, epoch, lr, decay=0.5):
-    """
-    Description:
-        Apply the baseline's "type1" schedule: multiply the learning rate by
-        `decay` each epoch (lr * decay**(epoch-1)). decay=0.5 is official and
-        means the rate is ~1/500th of its original value by epoch 10 -- which,
-        starting from 1e-4, is why the model barely moves in the later epochs.
-        decay=1.0 disables the schedule.
-    Args:
-        optimizer: the Adam optimizer being updated
-        epoch: 1-based epoch number just completed
-        lr: the base learning rate
-        decay: per-epoch multiplier
-    Returns:
-        None
-    """
-    new_lr = lr * (decay ** (epoch - 1))
-    for group in optimizer.param_groups:
-        group["lr"] = new_lr
-
-
-def clip_gradients(model, max_norm=50.0, global_norm=False):
-    """
-    Description:
-        Clip gradients the way the official baseline does: PER PARAMETER.
-        paddle.nn.ClipGradByNorm(50.0) bounds each parameter tensor separately.
-        torch.nn.utils.clip_grad_norm_(model.parameters(), ...) bounds the
-        GLOBAL norm instead -- that is paddle's ClipGradByGlobalNorm, a
-        different rule -- so we clip one parameter at a time.
-        Verified on paddle 3.3.1 with gradient norms 34.641 and 173.205 at
-        clip_norm 50: ClipGradByNorm left the first untouched and clipped the
-        second to 50.000; the global rule gives 9.806 and 49.029.
-    Args:
-        model: the model whose gradients are being clipped
-        max_norm: the per-parameter norm bound (50.0, from the official settings)
-        global_norm: True to use PyTorch's usual global rule instead
-    Returns:
-        None
-    """
-    if global_norm:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm)
-        return
-    for p in model.parameters():
-        if p.grad is not None:
-            torch.nn.utils.clip_grad_norm_([p], max_norm=max_norm)
-
-
-def run_epoch(model, loader, criterion, optimizer, device, out_var, train=True,
-              settings=None):
-    """
-    Description:
-        Run one pass over a data loader, optionally updating the model,
-        reproducing the official training loop exactly under the default
-        settings. Three deviations from a standard PyTorch loop are deliberate
-        and are marked inline: gradients are never zeroed, the optimizer is
-        applied twice per batch, and validation runs with dropout active. Each
-        is switchable via the settings dict so its cost can be measured.
-    Args:
-        model: the GRU being trained or evaluated
-        loader: DataLoader yielding (seq_x, seq_y) batches
-        criterion: the loss function (MSE)
-        optimizer: Adam optimizer (ignored when train=False)
-        device: torch device to run on
-        out_var: number of output variables (1); selects the target column
-        train: True to backpropagate, False for validation
-        settings: hyperparameter dict; the deviation switches are read from it
-    Returns:
-        The mean loss over the epoch as a float.
-    """
-    s = settings or {}
-    zero_grad = s.get("zero_grad", False)
-    double_step = s.get("double_step", True)
-    global_clip = s.get("global_clip", False)
-    clip_norm = s.get("clip_norm", 50.0)
-
-    # Deviation 2: the official train.py sets model.train() at the top of each
-    # epoch and its val() never switches to eval, so the validation loss driving
-    # early stopping is computed WITH dropout active. Hence train() either way,
-    # unless eval_val asks otherwise.
-    if train or not s.get("eval_val", False):
+    best, best_state, waited = float("inf"), None, 0
+    for epoch in range(cfg["epochs"]):
+        t0 = time.perf_counter()
         model.train()
-    else:
+        run = 0.0
+        for x, y in dl_tr:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model(x), y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["clip_norm"])
+            opt.step()
+            run += loss.item()
+        tr = run / max(1, len(dl_tr))
+
         model.eval()
+        run = 0.0
+        with torch.no_grad():
+            for x, y in dl_va:
+                x, y = x.to(device), y.to(device)
+                run += loss_fn(model(x), y).item()
+        va = run / max(1, len(dl_va))
+        if len(dl_tr):
+            sched.step()
 
-    losses = []
-    with torch.set_grad_enabled(train):
-        for batch_x, batch_y in loader:
-            batch_x = batch_x.float().to(device)
-            batch_y = batch_y.float().to(device)
-            sample = model(batch_x)
-            # Task 'MS': compare only the last out_var column(s) = Patv.
-            target = batch_y[:, -sample.shape[1]:, -out_var:]
-            loss = criterion(sample, target)
-            if train:
-                # Deviation 3: NO optimizer.zero_grad() by default. The official
-                # train.py never calls clear_grad() anywhere in the run, so the
-                # gradient buffer accumulates monotonically across every batch
-                # and every epoch. Verified with lr forced to 0: norms grew
-                # 1.00x, 2.00x, 3.00x, 4.00x over successive batches.
-                if zero_grad:
-                    optimizer.zero_grad()
-                loss.backward()
-                clip_gradients(model, clip_norm, global_clip)
-                optimizer.step()
-                # Deviation 4: paddle's `minimize(loss)` already applies the
-                # update and the official loop then calls `step()` too, giving
-                # two Adam applications per batch. Verified: 2.00x the weight
-                # movement of a single step.
-                if double_step:
-                    clip_gradients(model, clip_norm, global_clip)
-                    optimizer.step()
-            losses.append(loss.item())
-    return float(np.mean(losses)) if losses else float("nan")
+        if verbose:
+            print("[epoch {:>3}] train {:.5f}  inner-val {:.5f}  ({:.1f}s)"
+                  .format(epoch, tr, va, time.perf_counter() - t0))
 
-
-def train_one_turbine(data, tid, settings, device, ckpt_dir):
-    """
-    Description:
-        Train a single turbine's GRU with early stopping and save the best
-        weights plus that turbine's scaler statistics.
-    Args:
-        data: the full modeled-columns array from load_modeled_columns()
-        tid: turbine index to train
-        settings: hyperparameter dict from default_settings()
-        device: torch device
-        ckpt_dir: folder to write model_{tid}.pt into
-    Returns:
-        The best validation loss as a float.
-    """
-    # Seed per turbine, so this turbine's result does not depend on which
-    # turbines ran before it. That makes a partial run reproducible and lets
-    # --turbines shards run in parallel -- the training loop is launch-bound
-    # rather than compute-bound, so sharding is close to a linear speedup.
-    # settings["per_turbine_seed"] = False restores the official single-stream
-    # seeding, in which case main() has already seeded and we must not re-seed.
-    if settings.get("per_turbine_seed", True):
-        seed = OFFICIAL_FIX_SEED + int(tid)
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-    train_ds, val_ds, scaler = build_turbine_splits(data, tid, settings)
-    train_loader = DataLoader(train_ds, batch_size=settings["batch_size"],
-                              shuffle=True, drop_last=True)
-    # Deviation 8: the official get_data() passes shuffle=True for BOTH train
-    # and val, with drop_last=True -- so a different random subset of validation
-    # windows is discarded every epoch, adding noise to the early-stopping signal.
-    val_loader = DataLoader(val_ds, batch_size=settings["batch_size"],
-                            shuffle=settings.get("shuffle_val", True),
-                            drop_last=settings.get("shuffle_val", True))
-
-    model = BaselineGruModel(settings).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=settings["lr"])
-    criterion = nn.MSELoss(reduction="mean")
-
-    best_val = float("inf")     # lowest validation loss seen
-    bad_epochs = 0              # epochs since the last improvement
-    best_state = None           # weights corresponding to best_val
-
-    for epoch in range(1, settings["train_epochs"] + 1):
-        tr_loss = run_epoch(model, train_loader, criterion, optimizer, device,
-                            settings["out_var"], train=True, settings=settings)
-        va_loss = run_epoch(model, val_loader, criterion, optimizer, device,
-                            settings["out_var"], train=False, settings=settings)
-        print("    turbine {:3d} epoch {:2d}  train {:.6f}  val {:.6f}".format(
-            tid, epoch, tr_loss, va_loss))
-        if va_loss < best_val:
-            best_val = va_loss
-            bad_epochs = 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        if va < best - 1e-6:
+            best, waited = va, 0
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
         else:
-            bad_epochs += 1
-            if bad_epochs >= settings["patience"]:
-                print("    turbine {:3d} early stopped at epoch {}".format(tid, epoch))
+            waited += 1
+            if waited >= cfg["patience"]:
+                if verbose:
+                    print("[train] early stop at epoch {}".format(epoch))
                 break
-        adjust_learning_rate(optimizer, epoch + 1, settings["lr"],
-                             settings.get("lr_decay", 0.5))
-
-    # Persist weights AND scaler stats so inference needs no training CSV.
-    # `full_run` records whether this checkpoint came from a single pass over
-    # all 134 turbines. Deviation 7 means only such a run reproduces the
-    # official RNG stream; forecast() warns if it loads a partial one.
-    os.makedirs(ckpt_dir, exist_ok=True)
-    torch.save({"state_dict": best_state if best_state is not None else model.state_dict(),
-                "scaler_mean": scaler.mean,
-                "scaler_std": scaler.std,
-                "settings": settings,
-                "full_run": settings.get("_full_run", True),
-                "best_val_loss": best_val},
-               os.path.join(ckpt_dir, "model_{}.pt".format(tid)))
-    return best_val
+    return best_state, best
 
 
-def _has_checkpoints(ckpt_dir):
+def train_model(cfg, csv_path=None, ckpt_path=None, device=None, verbose=True):
     """
     Description:
-        Report whether a folder already holds any model_{tid}.pt files. Used to
-        detect a resumed run, which does not reproduce the official RNG stream.
+        Fit this baseline on one training prefix and write a checkpoint. The
+        config travels with the weights so forecast() rebuilds the identical
+        architecture without being told -- otherwise a sweep that changed
+        `hidden` would load old weights into a new shape.
+
+        scope=global    -> one model, all turbines pooled, one scaler
+        scope=per_turbine -> 134 models and 134 scalers in one checkpoint file
     Args:
-        ckpt_dir: folder to inspect
+        cfg: config dict (see default_config)
+        csv_path: training CSV. Under folds this MUST be the fold's fold_train.csv
+        ckpt_path: checkpoint destination
+        device: "cuda" / "cpu"
+        verbose: print per-epoch progress
     Returns:
-        True if at least one checkpoint is present.
+        Best inner-validation loss (mean over turbines when per_turbine).
     """
-    if not os.path.isdir(ckpt_dir):
-        return False
-    return any(n.startswith("model_") and n.endswith(".pt") for n in os.listdir(ckpt_dir))
+    csv_path = csv_path or VAL_TRAIN_FILE
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(cfg["seed"])
+
+    raw = load_farm_array(csv_path)
+    train_raw, inner_raw = split_prefix(raw, cfg["inner_val_days"])
+    n_in = N_FEATURES
+
+    blob = {"cfg": cfg, "n_in": n_in, "scope": cfg["scope"]}
+
+    if cfg["scope"] == "global":
+        scaler = Scaler().fit(train_raw)
+        train_arr = scaler.transform(train_raw)
+        inner_arr = scaler.transform(
+            np.concatenate([train_raw[:, -cfg["lookback"]:], inner_raw], axis=1))
+        if verbose:
+            n_par = sum(p.numel() for p in build_model(cfg, n_in).parameters())
+            print("[train] scope=global  {} params  device={}".format(n_par, device))
+        state, best = _fit_one(cfg, train_arr, inner_arr, n_in, device, None, verbose)
+        blob["state_dict"] = state
+        blob["scaler"] = scaler.state()
+
+    else:
+        states, scalers, losses = [], [], []
+        for tid in range(raw.shape[0]):
+            sc = Scaler().fit(train_raw[tid:tid + 1])
+            tr = sc.transform(train_raw[tid:tid + 1])
+            iv = sc.transform(np.concatenate(
+                [train_raw[tid:tid + 1, -cfg["lookback"]:], inner_raw[tid:tid + 1]],
+                axis=1))
+            st, bl = _fit_one(cfg, tr, iv, n_in, device, 0, False)
+            states.append(st); scalers.append(sc.state()); losses.append(bl)
+            if verbose and (tid % 10 == 0 or tid == raw.shape[0] - 1):
+                print("[train] scope=per_turbine  turbine {:>3}/{}  inner-val {:.5f}"
+                      .format(tid, raw.shape[0] - 1, bl))
+        blob["state_dicts"] = states
+        blob["scalers"] = scalers
+        best = float(np.mean(losses))
+
+    blob["inner_val_loss"] = best
+    if ckpt_path:
+        os.makedirs(os.path.dirname(os.path.abspath(ckpt_path)), exist_ok=True)
+        torch.save(blob, ckpt_path)
+        if verbose:
+            print("[train] wrote {}".format(ckpt_path))
+    return best
 
 
-def _announce(partial_turbines):
+_CACHE = {}
+
+
+def load_checkpoint(path, device=None):
+    """Load a checkpoint once and memoise it by path."""
+    key = (path, device)
+    if key in _CACHE:
+        return _CACHE[key]
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "no checkpoint at {}. Train this fold first.".format(path))
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    blob = torch.load(path, map_location=device, weights_only=False)
+    cfg = blob["cfg"]
+    if blob["scope"] == "global":
+        m = build_model(cfg, blob["n_in"]).to(device)
+        m.load_state_dict(blob["state_dict"])
+        m.eval()
+        out = (cfg, blob["scope"], [m], [Scaler.from_state(blob["scaler"])])
+    else:
+        models, scalers = [], []
+        for st, sc in zip(blob["state_dicts"], blob["scalers"]):
+            m = build_model(cfg, blob["n_in"]).to(device)
+            m.load_state_dict(st)
+            m.eval()
+            models.append(m)
+            scalers.append(Scaler.from_state(sc))
+        out = (cfg, blob["scope"], models, scalers)
+    _CACHE[key] = out
+    return out
+
+
+def predict_windows(envs, ckpt_template, device=None, clip_output=True):
     """
     Description:
-        Print, once, how this baseline is being run: dropout is live at
-        inference (deviation 1), so forecast() is stochastic, and whether any
-        checkpoint came from a partial training run (deviation 7).
+        The body of forecast(envs): resolve this fold's checkpoint, read the
+        window infile through the official loader, take the most recent
+        `lookback` steps per turbine, predict, and invert the normalisation
+        back to kW.
     Args:
-        partial_turbines: list of turbine ids whose checkpoints are stamped as
-            coming from a run that did not cover all 134 turbines
+        envs: evaluator settings dict, needs "path_to_test_x" and, under folds, "fold"
+        ckpt_template: checkpoint path, optionally containing "{fold}"
+        device: torch device string
+        clip_output: clamp predictions to [0, RATED_KW]. A turbine cannot
+                     produce negative power, and cannot exceed its rating -- so
+                     a forecast outside that range is not a forecast. Cheap
+                     insurance: it is worth almost nothing on the metric, which
+                     averages 38,592 predictions per window, but it stops the
+                     model emitting values that are physically impossible.
     Returns:
-        None
+        float array (capacity, OUTPUT_LEN, 1) of predicted Patv in kW.
     """
-    if INFER_DROPOUT:
-        print("[gru] dropout is ACTIVE at inference (official behaviour), so "
-              "forecast() is STOCHASTIC -- score several times and report "
-              "mean +/- std.", flush=True)
-    if INFER_SEED is not None:
-        print("[gru] inference seeded with SDWPF_GRU_INFER_SEED={}".format(INFER_SEED),
-              flush=True)
-    if partial_turbines:
-        print("[gru] NOTE: {} checkpoint(s) came from a partial training run "
-              "(e.g. turbine {}). With per-turbine seeding this is reproducible "
-              "and shardable, so it is only a problem if the run is INCOMPLETE. "
-              "Under official single-stream seeding it would also fail to "
-              "reproduce the published RNG stream.".format(
-                  len(partial_turbines), partial_turbines[0]), flush=True)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    path = resolve_fold_path(envs, ckpt_template)
+    cfg, scope, models, scalers = load_checkpoint(path, device)
+    capacity = envs.get("capacity", CAPACITY)
+    L = cfg["lookback"]
 
+    test_x = TestData(path_to_data=envs["path_to_test_x"],
+                      start_col=START_COL, farm_capacity=capacity)
 
-def _load_all(capacity, envs=None):
-    """
-    Description:
-        Load every turbine's checkpoint and populate the module cache with the
-        models, their scaler statistics, and the training settings. The cache is
-        keyed on the RESOLVED checkpoint directory, so scoring a second fold in
-        the same process reloads that fold's weights rather than serving the
-        previous fold's.
-    Args:
-        capacity: number of turbines expected (134)
-        envs: settings dict from forecast(); supplies "fold" when present
-    Returns:
-        None
-    """
-    ckpt_dir = _resolve_path(envs, CHECKPOINTS)
-    if _CACHE["models"] is not None and _CACHE["path"] == ckpt_dir:
-        return
-    device = pick_device()
-    # Announce which checkpoint folder is being used, so the scorer's output
-    # makes the source unambiguous (e.g. ckpt_val vs ckpt_F3).
-    print("[gru] loading {} checkpoints from: {}".format(capacity, ckpt_dir), flush=True)
-    models, scalers, settings, partial = [], [], None, []
+    raw = np.zeros((capacity, L, N_FEATURES), dtype=np.float32)
     for tid in range(capacity):
-        path = os.path.join(ckpt_dir, "model_{}.pt".format(tid))
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                "Missing checkpoint for turbine {} at {!r}. Train it first: "
-                "python baseline_models/gru/gru_baseline.py".format(tid, path))
-        blob = torch.load(path, map_location=device, weights_only=False)
-        settings = blob["settings"]
-        model = BaselineGruModel(settings).to(device)
-        model.load_state_dict(blob["state_dict"])
-        # The official predict.py never calls model.eval(), and paddle Layers
-        # default to training=True, so the published 47.850 was produced with
-        # dropout ACTIVE at inference -- which makes forecast() stochastic and
-        # every score a draw rather than a number. INFER_DROPOUT restores that
-        # for the provenance row; the default is a deterministic forecast.
-        model.train() if INFER_DROPOUT else model.eval()
-        models.append(model)
-        scalers.append((blob["scaler_mean"], blob["scaler_std"]))
-        if not blob.get("full_run", True):
-            partial.append(tid)
-    _CACHE.update({"models": models, "scalers": scalers,
-                   "settings": settings, "device": device, "path": ckpt_dir})
-    _announce(partial)
+        seq, _ = test_x.get_turbine(tid)
+        seq = np.asarray(seq, dtype=np.float32)
+        if seq.shape[0] < L:
+            # Left-pad with the oldest observation rather than zeros: zero is a
+            # legitimate power reading and would be read as a dead turbine.
+            pad = np.repeat(seq[:1], L - seq.shape[0], axis=0)
+            seq = np.concatenate([pad, seq], axis=0)
+        raw[tid] = seq[-L:]
+
+    out = np.zeros((capacity, OUTPUT_LEN), dtype=np.float64)
+    with torch.no_grad():
+        if scope == "global":
+            xs = scalers[0].transform(raw)
+            pred = models[0](torch.from_numpy(xs).float().to(device)).cpu().numpy()
+            out[:] = scalers[0].inverse_target(pred)
+        else:
+            for tid in range(capacity):
+                sc, m = scalers[tid], models[tid]
+                xs = sc.transform(raw[tid:tid + 1])
+                p = m(torch.from_numpy(xs).float().to(device)).cpu().numpy()
+                out[tid] = sc.inverse_target(p)[0]
+
+    if clip_output:
+        out = np.clip(out, 0.0, RATED_KW)
+    return out.reshape(capacity, OUTPUT_LEN, 1).astype(float)
+
+
+def base_config(**overrides):
+    """
+    Description:
+        Hyperparameters shared by every neural baseline in this directory.
+        Kept identical across the files ON PURPOSE: a knob that means the same
+        thing everywhere is what makes their scores comparable. Change one here
+        and change it in all of them.
+    Args:
+        **overrides: model-specific values
+    Returns:
+        A config dict.
+    """
+    cfg = {
+        "lookback": 144,         # 24 h -- pinned to the official GRU baseline
+        "scope": "global",       # "global" or "per_turbine"
+        "stride": 6,             # keep every 6th forecast origin (hourly)
+        "loss": "mse",           # "mse" (official) / "l1" / "half"
+        "batch_size": 256,
+        "lr": 1e-3,
+        "lr_decay": 0.95,
+        "epochs": 40,
+        "patience": 8,
+        "clip_norm": 5.0,
+        "inner_val_days": 20,    # tail of the training prefix, early stop only
+        "seed": 3407,            # matches the GRU baseline's base seed
+        "num_workers": 4,
+    }
+    cfg.update(overrides)
+    return cfg
+# ===========================================================================
+# MODEL -- everything below this line is specific to the GRU.
+# ===========================================================================
+CKPT = os.environ.get(
+    "SDWPF_GRU_CKPT",
+    os.path.join(_HERE, "checkpoints", "gru_{fold}.pt"))
+
+LOOKBACK = 144          # 24 h -- the official baseline's input length
+SCOPE = "global"        # "global" (1 model) or "per_turbine" (134 models)
+HIDDEN = 96             # width of the summary carried between steps. CHAMPION
+LAYERS = 2              # official baseline value
+DROPOUT = 0.05          # official baseline value
+LOSS = "mse"            # official baseline uses nn.MSELoss
+CLIP_OUTPUT = True     # clamp to [0, RATED_KW]; see the .md
+
+
+def default_config(**overrides):
+    """
+    Description:
+        This model's config: the shared base plus its architecture keys, with
+        the module-level constants as defaults so sweep overrides take effect.
+    Args:
+        **overrides: values from a CLI flag or a sweep point
+    Returns:
+        A config dict.
+    """
+    cfg = base_config(
+        lookback=LOOKBACK, scope=SCOPE, loss=LOSS,
+        hidden=HIDDEN, layers=LAYERS, dropout=DROPOUT,
+        lr=1e-4, batch_size=256, epochs=40, patience=8,
+    )
+    cfg.update(overrides)
+    return cfg
+
+
+class GRUForecaster(nn.Module):
+    """
+    Description:
+        GRU encoder over the lookback window, flat linear head to the horizon.
+
+        The head reads the final hidden state of the top layer. Emitting all
+        288 steps in one projection means errors never compound, unlike
+        step-by-step decoding.
+    """
+
+    def __init__(self, cfg, n_in):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=n_in,
+            hidden_size=cfg["hidden"],
+            num_layers=cfg["layers"],
+            batch_first=True,
+            dropout=cfg["dropout"] if cfg["layers"] > 1 else 0.0,
+        )
+        self.drop = nn.Dropout(cfg["dropout"])
+        self.head = nn.Linear(cfg["hidden"], OUTPUT_LEN)
+
+    def forward(self, x):
+        """
+        Args:
+            x: (batch, lookback, channels) normalised history
+        Returns:
+            (batch, OUTPUT_LEN) normalised Patv forecast.
+        """
+        out, _ = self.gru(x)
+        return self.head(self.drop(out[:, -1]))
+
+
+def build_model(cfg, n_in):
+    """Factory used by the shared pipeline."""
+    return GRUForecaster(cfg, n_in)
+
+
+def train(train_csv=None, ckpt_path=None, device=None, verbose=True, **overrides):
+    """
+    Description:
+        Fit this baseline and write a checkpoint. Under a rolling-origin
+        layout, call once per fold with that fold's fold_train.csv -- each fold
+        must have its own model or it trains on its own validation targets.
+    Args:
+        train_csv: training CSV (default VAL_TRAIN_FILE)
+        ckpt_path: checkpoint destination
+        device: "cuda" / "cpu"
+        verbose: print progress
+        **overrides: any config key
+    Returns:
+        Best inner-validation loss (float).
+    """
+    return train_model(default_config(**overrides), csv_path=train_csv,
+                       ckpt_path=ckpt_path, device=device, verbose=verbose)
 
 
 def forecast(envs):
     """
     Description:
-        Produce a 48h active-power forecast for every turbine using the trained
-        per-turbine GRU baseline. This is the program contract used by
-        evaluator.py, so the baseline is scored with the official metric.
+        The program contract used by evaluator.py.
     Args:
-        envs: settings dict; must contain "path_to_test_x" (the infile path).
-              Optional "capacity" overrides the turbine count.
+        envs: settings dict with "path_to_test_x" and, under folds, "fold"
     Returns:
-        A float array of shape (capacity, output_len, 1) with predicted Patv (kW).
+        float array (134, 288, 1) of predicted Patv in kW.
     """
-    capacity = envs.get("capacity", 134)
-    _load_all(capacity, envs)
-    models, scalers = _CACHE["models"], _CACHE["scalers"]
-    settings, device = _CACHE["settings"], _CACHE["device"]
-    # In faithful mode dropout is live, so forecast() is stochastic. The
-    # official predict.py seeds nothing; SDWPF_GRU_INFER_SEED makes a given run
-    # repeatable without removing the noise.
-    if INFER_SEED is not None:
-        torch.manual_seed(int(INFER_SEED))
-    input_len = settings["input_len"]
-    output_len = settings["output_len"]
-    out_var = settings["out_var"]
-
-    # Official loader: per-turbine arrays of the modeled columns with NaN -> 0.
-    test_x = TestData(path_to_data=envs["path_to_test_x"],
-                      start_col=settings["start_col"],
-                      farm_capacity=capacity)
-
-    predictions = np.zeros((capacity, output_len, out_var), dtype=float)
-    with torch.no_grad():
-        for tid in range(capacity):
-            seq, _ = test_x.get_turbine(tid)             # (n_steps, in_var), NaN->0
-            mean, std = scalers[tid]
-            seq = (np.asarray(seq, dtype=np.float32) - mean) / std
-            last_observ = seq[-input_len:]               # most recent input window
-            batch = torch.from_numpy(last_observ).float().unsqueeze(0).to(device)
-            pred = models[tid](batch).squeeze(0).cpu().numpy()
-            predictions[tid] = pred * std + mean         # inverse transform to kW
-
-    if CLIP_NEGATIVE:
-        predictions = np.clip(predictions, 0.0, None)
-    return predictions
+    return predict_windows(envs, CKPT, clip_output=CLIP_OUTPUT)
 
 
 def main():
-    """
-    Description:
-        Parse arguments, load the training data once, seed as the official run
-        does, and train the turbines in order.
-    Args:
-        None
-    Returns:
-        None
-    """
-    parser = argparse.ArgumentParser(
-        description="Train the per-turbine SDWPF GRU baseline (official behaviour)")
-    parser.add_argument("--data", type=str, default=DEFAULT_TRAIN_CSV,
-                        help="Path to sdwpf_245days_v1.csv")
-    parser.add_argument("--checkpoints", type=str, default=CHECKPOINTS,
-                        help="Folder for model_{tid}.pt checkpoints")
-    parser.add_argument("--turbines", type=str, default=None,
-                        help="SMOKE TESTS ONLY, e.g. '0-2'. The official run covers all 134 "
-                             "turbines in one pass from a single seed, so a subset does not "
-                             "reproduce it; such checkpoints are stamped partial and scoring "
-                             "warns about them. Default: all 134")
-    parser.add_argument("--epochs", type=int, default=None,
-                        help="Override max epochs (official: 10). Smoke tests only")
-    parser.add_argument("--batch-size", type=int, default=None,
-                        help="Override batch size (official: 32). Smoke tests only")
-    parser.add_argument("--train-days", type=int, default=None,
-                        help="Inner-training days used for fitting. Default: the official "
-                             "214/245 proportion of whatever --data actually contains "
-                             "(245-day file -> 214; 196-day val_train.csv -> 171)")
-    parser.add_argument("--val-days", type=int, default=None,
-                        help="Inner-validation days used ONLY for early stopping. Must sum "
-                             "with --train-days to the file's day count. Default: the "
-                             "remainder (245-day file -> 31; 196-day file -> 25)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Base training seed (official: 3407). Per-turbine seeds "
-                             "are seed+tid, so changing this gives an independent "
-                             "training run -- use it to measure the noise floor")
-    parser.add_argument("--patience", type=int, default=None,
-                        help="Early-stopping patience in epochs (official: 3)")
-    parser.add_argument("--input-len", type=int, default=None,
-                        help="History steps fed to the GRU (official: 144 = 24h, to "
-                             "predict 288 = 48h). Larger gives the model more context")
-    parser.add_argument("--hidden", type=int, default=None,
-                        help="GRU hidden size (official: 48)")
-    parser.add_argument("--layers", type=int, default=None,
-                        help="Stacked GRU layers (official: 2)")
-    parser.add_argument("--dropout", type=float, default=None,
-                        help="Dropout before the projection (official: 0.05)")
-    parser.add_argument("--lr", type=float, default=None,
-                        help="Adam learning rate (official: 1e-4)")
-    parser.add_argument("--lr-decay", type=float, default=None,
-                        help="Per-epoch LR multiplier (official: 0.5; 1.0 disables)")
-    parser.add_argument("--official", action="store_true",
-                        help="Restore the official Baidu loop, defects and all: "
-                             "gradients never zeroed, two optimizer steps per batch, "
-                             "per-parameter clipping, dropout live during validation, "
-                             "and a single RNG stream seeded once before the turbine "
-                             "loop. Use only to reproduce the published 47.850")
-    parser.add_argument("--device", type=str, default=None, help="cuda | mps | cpu (default: auto)")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="Retrain turbines whose checkpoints already exist")
-    args = parser.parse_args()
+    """CLI: train one model."""
+    p = argparse.ArgumentParser(description="Train the GRU baseline")
+    p.add_argument("--train-csv", type=str, default=None,
+                   help="training CSV; under folds, that fold's fold_train.csv")
+    p.add_argument("--ckpt", type=str, default=None,
+                   help="checkpoint path; must be fold-specific under folds")
+    p.add_argument("--scope", type=str, default=None,
+                   choices=["global", "per_turbine"])
+    p.add_argument("--lookback", type=int, default=None)
+    p.add_argument("--loss", type=str, default=None, choices=["mse", "l1", "half"])
+    p.add_argument("--hidden", type=int, default=None)
+    p.add_argument("--layers", type=int, default=None)
+    p.add_argument("--dropout", type=float, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--stride", type=int, default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--device", type=str, default=None)
+    a = p.parse_args()
 
-    settings = default_settings()
+    over = {k: v for k, v in [
+        ("scope", a.scope), ("lookback", a.lookback), ("loss", a.loss),
+        ("hidden", a.hidden), ("layers", a.layers), ("dropout", a.dropout),
+        ("lr", a.lr), ("epochs", a.epochs), ("stride", a.stride),
+        ("seed", a.seed)] if v is not None}
 
-    # --official first, as a base preset: it restores the whole official
-    # configuration (four loop defects, single-stream seeding, and the training
-    # budget/schedule, which now differ by default -- 40/8/0.9 vs 10/3/0.5).
-    # Explicit flags are applied AFTER it, so they still win.
-    if args.official:
-        settings.update({"zero_grad": False, "double_step": True,
-                         "global_clip": False, "eval_val": False,
-                         "shuffle_val": True, "per_turbine_seed": False,
-                         "train_epochs": 10, "patience": 3, "lr_decay": 0.5})
-        print("*** --official: reproducing the Baidu loop INCLUDING its four "
-              "known defects; train all 134 turbines in one pass or the RNG "
-              "stream will not match ***")
-
-    if args.epochs is not None:
-        settings["train_epochs"] = args.epochs
-    if args.batch_size is not None:
-        settings["batch_size"] = args.batch_size
-    for key, val in (("input_len", args.input_len), ("hidden", args.hidden),
-                     ("patience", args.patience),
-                     ("lstm_layer", args.layers), ("dropout", args.dropout),
-                     ("lr", args.lr), ("lr_decay", args.lr_decay)):
-        if val is not None:
-            settings[key] = val
-    if args.seed is not None:
-        globals()["OFFICIAL_FIX_SEED"] = args.seed
-        print("base seed    : {} (non-default)".format(args.seed))
-
-    device = pick_device(args.device)
-    turbines = parse_turbines(args.turbines, settings["capacity"])
-    full_run = (len(turbines) == settings["capacity"]) and not _has_checkpoints(args.checkpoints)
-    settings["_full_run"] = full_run
-
-    # Under the default per-turbine seeding, train_one_turbine() seeds itself
-    # from OFFICIAL_FIX_SEED + tid, so this global seed is only needed for
-    # --official, which reproduces the single RNG stream the Baidu code uses.
-    if not settings.get("per_turbine_seed", True):
-        random.seed(OFFICIAL_FIX_SEED)
-        np.random.seed(OFFICIAL_FIX_SEED)
-        torch.manual_seed(OFFICIAL_FIX_SEED)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(OFFICIAL_FIX_SEED)
-
-    print("device      : {}".format(device))
-    print("turbines    : {} (n={})".format(
-        "{}..{}".format(turbines[0], turbines[-1]) if turbines else "none", len(turbines)))
-    print("checkpoints : {}".format(args.checkpoints))
-    per_turb = settings.get("per_turbine_seed", True)
-    print("seed        : {}{}".format(
-        OFFICIAL_FIX_SEED,
-        " + turbine id (per-turbine; shards are independent)" if per_turb
-        else " (set once before the turbine loop; official single stream)"))
-    if not full_run:
-        print("")
-        if per_turb:
-            print("  Partial run: {} of {} turbines{}.".format(
-                len(turbines), settings["capacity"],
-                ", resuming an existing folder" if
-                _has_checkpoints(args.checkpoints) else ""))
-            print("  With per-turbine seeding this is reproducible and shardable --")
-            print("  each turbine seeds itself, so its weights do not depend on which")
-            print("  turbines ran before it. Only an INCOMPLETE set is a problem:")
-            print("  scoring needs all {} checkpoints present.".format(settings["capacity"]))
-        else:
-            print("  *** PARTIAL RUN UNDER --official -- SMOKE TEST ONLY ***")
-            print("  --official seeds once before the loop, so every turbine's weights")
-            print("  depend on the ones before it. This run covers {} turbine(s) and".format(
-                len(turbines)))
-            print("  therefore does NOT reproduce the official RNG stream. For the real")
-            print("  run: delete the checkpoint folder and pass no --turbines.")
-        print("")
-
-    print("loading training data ...")
-    t0 = time.perf_counter()
-    data = load_modeled_columns(args.data, settings["start_col"])
-    print("  loaded {} rows x {} cols in {:.1f}s".format(
-        data.shape[0], data.shape[1], time.perf_counter() - t0))
-
-    # Override the 245-day defaults with the file's real geometry. Do this
-    # BEFORE any turbine is touched: total_size is the per-turbine stride, so a
-    # stale value silently misaligns every turbine after the first.
-    resolve_day_sizes(data, settings, args.train_days, args.val_days)
-    print("split       : {} days total -> {} inner-train / {} early-stopping".format(
-        settings["total_size"], settings["train_size"], settings["val_size"]))
-    if settings["total_size"] != 245:
-        print("              (non-competition file length -- if this is val_train.csv, "
-              "the held-out period is NOT visible to training or early stopping)")
-
-    start_all = time.perf_counter()
-    for n, tid in enumerate(turbines, 1):
-        ckpt = os.path.join(args.checkpoints, "model_{}.pt".format(tid))
-        if os.path.exists(ckpt) and not args.overwrite:
-            print("[{}/{}] turbine {:3d}: checkpoint exists, skipping".format(n, len(turbines), tid))
-            continue
-        t_turb = time.perf_counter()
-        print("[{}/{}] training turbine {:3d}".format(n, len(turbines), tid))
-        best = train_one_turbine(data, tid, settings, device, args.checkpoints)
-        print("    done in {:.1f}s (best val {:.6f})".format(time.perf_counter() - t_turb, best))
-
-    print("all requested turbines finished in {:.1f}s".format(time.perf_counter() - start_all))
+    ckpt = a.ckpt or CKPT
+    if "{fold}" in ckpt:
+        raise SystemExit(
+            "--ckpt still contains '{fold}'. Training fits ONE fold at a time; "
+            "pass the resolved path, e.g. .../gru_F1.pt")
+    train(train_csv=a.train_csv, ckpt_path=ckpt, device=a.device, **over)
 
 
 if __name__ == "__main__":
